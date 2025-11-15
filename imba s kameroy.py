@@ -524,7 +524,7 @@ class MacroApp(QWidget):
 
             playback_start_time = time.perf_counter()
             rmb_center = None  # Сброс центра для каждого цикла
-            last_mouse_pos = None
+            last_mouse_pos = None  # Сброс последней позиции для каждого цикла
 
             for event in events:
                 if not self.is_playing:
@@ -549,23 +549,22 @@ class MacroApp(QWidget):
                     elif event_type == 'mouse_move':
                         x, y = event_args[0], event_args[1]
                         if mouse.Button.right in pressed_buttons and rmb_center is not None:
-                            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: дельта от текущего центра (последняя позиция)
-                            # Это обеспечивает правильное инкрементальное движение камеры
-                            dx = int((x - rmb_center[0]) * CAMERA_GAIN)
-                            dy = int((y - rmb_center[1]) * CAMERA_GAIN)
+                            # ПРАВИЛЬНАЯ ЛОГИКА: инкрементальное движение от предыдущей позиции
+                            # Используем last_mouse_pos для расчета дельты, а не rmb_center
+                            if last_mouse_pos is not None:
+                                dx = int((x - last_mouse_pos[0]) * CAMERA_GAIN)
+                                dy = int((y - last_mouse_pos[1]) * CAMERA_GAIN)
+                                
+                                # Отправляем движение если оно значимое
+                                if abs(dx) >= MIN_STEP_THRESHOLD or abs(dy) >= MIN_STEP_THRESHOLD:
+                                    if DEBUG_CAMERA_MOVEMENT:
+                                        self.signals.log_message.emit(
+                                            f"[CAM DEBUG] RMB incremental: prev({last_mouse_pos[0]},{last_mouse_pos[1]}) "
+                                            f"curr({x},{y}) delta({dx},{dy})"
+                                        )
+                                    send_relative_line(dx, dy)
                             
-                            # Отправляем движение если оно значимое
-                            if abs(dx) >= MIN_STEP_THRESHOLD or abs(dy) >= MIN_STEP_THRESHOLD:
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[CAM DEBUG] RMB move: pos({x},{y}) center({rmb_center[0]},{rmb_center[1]}) "
-                                        f"delta({dx},{dy})"
-                                    )
-                                send_relative_line(dx, dy)
-                            
-                            # КРИТИЧНО: обновляем центр на новую позицию после каждого движения
-                            # Это заставляет следующее движение быть инкрементальным от этой позиции
-                            rmb_center = (x, y)
+                            # НЕ обновляем rmb_center - он остается точкой нажатия ПКМ
                             # НИЧЕГО абсолютного не двигаем, когда ПКМ зажата
                         else:
                             # Вне режима камеры — обычное абсолютное перемещение
@@ -583,11 +582,11 @@ class MacroApp(QWidget):
                             pressed_buttons.add(button)
                             mouse_controller.press(button)
                             if button == mouse.Button.right:
-                                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Зафиксировать центр на момент нажатия ПКМ
-                                # Это станет базовой позицией для инкрементальных дельта-расчетов
+                                # При нажатии ПКМ устанавливаем центр и инициализируем последнюю позицию
                                 rmb_center = (x, y)
+                                last_mouse_pos = (x, y)  # Важно для правильного старта инкрементальных расчетов
                                 if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB pressed at: ({x}, {y})")
+                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB pressed at: ({x}, {y}), initialized last_mouse_pos")
 
                     elif event_type == 'mouse_release':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
@@ -598,8 +597,9 @@ class MacroApp(QWidget):
                             pressed_buttons.discard(button)
                             if button == mouse.Button.right:
                                 if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB released at: ({x}, {y})")
+                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB released at: ({x}, {y}), resetting camera state")
                                 rmb_center = None  # сброс «центра» по отпусканию
+                                # last_mouse_pos не сбрасываем - он нужен для следующих движений
 
                     elif event_type == 'mouse_scroll':
                         mouse_controller.scroll(event_args[0], event_args[1])
