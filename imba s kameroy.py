@@ -45,8 +45,9 @@ MOUSE_BUTTONS = {
 }
 
 # --- Настройки симуляции камеры ---
-CAMERA_GAIN = 0.7           # Увеличь до 10–30, если вращается слабо
-MIN_STEP_THRESHOLD = 1    # Минимальный модуль дельты, чтобы отправлять движение
+CAMERA_GAIN = 1.0           # Множитель для чувствительности камеры (1.0 = 100% точность)
+MIN_STEP_THRESHOLD = 0    # Минимальный модуль дельты, чтобы отправлять движение
+DEBUG_CAMERA_MOVEMENT = True  # Детальное логирование движений камеры
 
 # --- Низкоуровневый хелпер для относительного движения (Windows: SendInput) ---
 IS_WINDOWS = platform.system() == "Windows"
@@ -423,6 +424,10 @@ class MacroApp(QWidget):
         def get_offset(): return time.perf_counter() - start_time
         mouse_controller = mouse.Controller()
         self.recorded_events.append(('mouse_pos', (mouse_controller.position[0], mouse_controller.position[1], 0.0)))
+        
+        # Отслеживание для дебага камеры
+        last_rmb_state = False
+        mouse_move_count = 0
 
         def on_press(key):
             if not self.is_recording: return
@@ -439,15 +444,32 @@ class MacroApp(QWidget):
         def on_click(x, y, button, pressed):
             if not self.is_recording: return
             action = 'mouse_press' if pressed else 'mouse_release'
-            self.recorded_events.append((action, (x, y, str(button), get_offset())))
+            offset = get_offset()
+            self.recorded_events.append((action, (x, y, str(button), offset)))
+            # Логируем нажатие и отпускание кнопок для отладки камеры
+            if DEBUG_CAMERA_MOVEMENT:
+                button_name = str(button).replace('Button.', '')
+                if pressed and button_name == 'right':
+                    self.signals.log_message.emit(f"[REC DEBUG] RMB pressed at ({x}, {y}), offset={offset:.3f}s")
+                elif not pressed and button_name == 'right':
+                    self.signals.log_message.emit(f"[REC DEBUG] RMB released at ({x}, {y}), offset={offset:.3f}s")
 
         def on_scroll(x, y, dx, dy):
             if not self.is_recording: return
             self.recorded_events.append(('mouse_scroll', (dx, dy, get_offset())))
 
         def on_move(x, y):
+            nonlocal last_rmb_state, mouse_move_count
             if not self.is_recording: return
-            self.recorded_events.append(('mouse_move', (x, y, get_offset())))
+            offset = get_offset()
+            self.recorded_events.append(('mouse_move', (x, y, offset)))
+            
+            # Логируем движение мыши при зажатой ПКМ
+            if DEBUG_CAMERA_MOVEMENT:
+                mouse_move_count += 1
+                # Логируем каждое 5-е движение чтобы не засорить лог
+                if mouse_move_count % 5 == 0:
+                    self.signals.log_message.emit(f"[REC DEBUG] Mouse move #{mouse_move_count}: ({x}, {y}), offset={offset:.3f}s")
 
         k_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         m_listener = mouse.Listener(on_click=on_click, on_scroll=on_scroll, on_move=on_move)
@@ -480,7 +502,8 @@ class MacroApp(QWidget):
 
         # Состояние кнопок и "центр" для ПКМ
         pressed_buttons = set()
-        rmb_center = None  # (cx, cy) координаты на момент нажатия ПКМ
+        rmb_center = None  # (cx, cy) координаты - текущий центр для дельта-расчета
+        last_mouse_pos = None  # Последняя известная позиция мыши
 
         # Обратный отсчет
         for i in range(3, 0, -1):
@@ -500,6 +523,8 @@ class MacroApp(QWidget):
                 continue
 
             playback_start_time = time.perf_counter()
+            rmb_center = None  # Сброс центра для каждого цикла
+            last_mouse_pos = None
 
             for event in events:
                 if not self.is_playing:
@@ -517,19 +542,37 @@ class MacroApp(QWidget):
                         # Исходная позиция только один раз для старта
                         x, y = event_args[0], event_args[1]
                         mouse_controller.position = (x, y)
+                        last_mouse_pos = (x, y)
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(f"[CAM DEBUG] Initial mouse_pos: ({x}, {y})")
 
                     elif event_type == 'mouse_move':
                         x, y = event_args[0], event_args[1]
                         if mouse.Button.right in pressed_buttons and rmb_center is not None:
-                            # Дельта от центра (то, что Roblox реально использует при захвате)
+                            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: дельта от текущего центра (последняя позиция)
+                            # Это обеспечивает правильное инкрементальное движение камеры
                             dx = int((x - rmb_center[0]) * CAMERA_GAIN)
                             dy = int((y - rmb_center[1]) * CAMERA_GAIN)
+                            
+                            # Отправляем движение если оно значимое
                             if abs(dx) >= MIN_STEP_THRESHOLD or abs(dy) >= MIN_STEP_THRESHOLD:
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(
+                                        f"[CAM DEBUG] RMB move: pos({x},{y}) center({rmb_center[0]},{rmb_center[1]}) "
+                                        f"delta({dx},{dy})"
+                                    )
                                 send_relative_line(dx, dy)
+                            
+                            # КРИТИЧНО: обновляем центр на новую позицию после каждого движения
+                            # Это заставляет следующее движение быть инкрементальным от этой позиции
+                            rmb_center = (x, y)
                             # НИЧЕГО абсолютного не двигаем, когда ПКМ зажата
                         else:
                             # Вне режима камеры — обычное абсолютное перемещение
                             mouse_controller.position = (x, y)
+                            if DEBUG_CAMERA_MOVEMENT and mouse.Button.right not in pressed_buttons:
+                                self.signals.log_message.emit(f"[CAM DEBUG] Normal mouse_move: ({x}, {y})")
+                        last_mouse_pos = (x, y)
 
                     elif event_type == 'mouse_press':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
@@ -540,8 +583,11 @@ class MacroApp(QWidget):
                             pressed_buttons.add(button)
                             mouse_controller.press(button)
                             if button == mouse.Button.right:
-                                # Зафиксировать центр на момент нажатия ПКМ
+                                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Зафиксировать центр на момент нажатия ПКМ
+                                # Это станет базовой позицией для инкрементальных дельта-расчетов
                                 rmb_center = (x, y)
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB pressed at: ({x}, {y})")
 
                     elif event_type == 'mouse_release':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
@@ -551,10 +597,14 @@ class MacroApp(QWidget):
                             mouse_controller.release(button)
                             pressed_buttons.discard(button)
                             if button == mouse.Button.right:
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB released at: ({x}, {y})")
                                 rmb_center = None  # сброс «центра» по отпусканию
 
                     elif event_type == 'mouse_scroll':
                         mouse_controller.scroll(event_args[0], event_args[1])
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(f"[CAM DEBUG] Scroll: dx={event_args[0]}, dy={event_args[1]}")
 
                     elif event_type == 'key_press':
                         key = SPECIAL_KEYS.get(event_args[0]) or event_args[0]
@@ -565,7 +615,7 @@ class MacroApp(QWidget):
                         keyboard_controller.release(key)
 
                 except Exception as e:
-                    self.signals.log_message.emit(f"Ошибка: {e}")
+                    self.signals.log_message.emit(f"Ошибка при воспроизведении: {e}")
 
             if not self.is_playing:
                 break
