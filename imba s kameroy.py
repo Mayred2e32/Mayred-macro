@@ -54,6 +54,7 @@ IS_WINDOWS = platform.system() == "Windows"
 
 if IS_WINDOWS:
     import ctypes
+    import time
     from ctypes import wintypes
 
     # Константы и структуры для SendInput
@@ -80,6 +81,11 @@ if IS_WINDOWS:
 
     user32 = ctypes.windll.user32
     SendInput = user32.SendInput
+    # Альтернатива: старый mouse_event API
+    mouse_event = user32.mouse_event
+    
+    # Константы для mouse_event
+    MOUSEEVENTF_MOVE_OLD = 0x0001
 
     def _build_move_input(dx: int, dy: int) -> INPUT:
         inp = INPUT()
@@ -93,41 +99,42 @@ if IS_WINDOWS:
         return inp
 
     def send_relative_line(dx: int, dy: int):
-        """Разбиваем смещение на шаги по 1 пикселю и шлем пачкой (без коалесинга)."""
+        """Улучшенная реализация: разбиваем на маленькие шаги с задержками для игр."""
         dx = int(dx); dy = int(dy)
         if dx == 0 and dy == 0:
             return
 
-        steps = max(abs(dx), abs(dy))
-        step_x = dx / float(steps)
-        step_y = dy / float(steps)
-        cur_x = 0.0
-        cur_y = 0.0
-        prev_ix = 0
-        prev_iy = 0
+        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: каждый вызов функции
+        if DEBUG_CAMERA_MOVEMENT:
+            print(f"[SEND_RELATIVE] Called with dx={dx}, dy={dy}")
 
-        batch = []
-        BATCH_SIZE = 128
-
-        for _ in range(steps):
-            cur_x += step_x
-            cur_y += step_y
-            ix = int(round(cur_x))
-            iy = int(round(cur_y))
-            sx = ix - prev_ix
-            sy = iy - prev_iy
-            if sx != 0 or sy != 0:
-                batch.append(_build_move_input(sx, sy))
-                prev_ix = ix
-                prev_iy = iy
-                if len(batch) >= BATCH_SIZE:
-                    arr = (INPUT * len(batch))(*batch)
-                    SendInput(len(batch), arr, ctypes.sizeof(INPUT))
-                    batch.clear()
-
-        if batch:
-            arr = (INPUT * len(batch))(*batch)
-            SendInput(len(batch), arr, ctypes.sizeof(INPUT))
+        # РАЗБИВАЕМ НА МАЛЕНЬКИЕ ШАГИ с задержками
+        # Это помогает играм лучше обрабатывать движения
+        max_step = 3  # максимальный шаг за один раз
+        steps_x = abs(dx) // max_step + (1 if abs(dx) % max_step != 0 else 0)
+        steps_y = abs(dy) // max_step + (1 if abs(dy) % max_step != 0 else 0)
+        total_steps = max(steps_x, steps_y, 1)
+        
+        step_dx = dx / total_steps
+        step_dy = dy / total_steps
+        
+        for i in range(total_steps):
+            current_dx = int(step_dx * (i + 1)) - int(step_dx * i)
+            current_dy = int(step_dy * (i + 1)) - int(step_dy * i)
+            
+            if current_dx != 0 or current_dy != 0:
+                # Используем mouse_event для лучшей совместимости с играми
+                mouse_event(MOUSEEVENTF_MOVE_OLD, current_dx, current_dy, 0, 0)
+                
+                if DEBUG_CAMERA_MOVEMENT:
+                    print(f"[SEND_RELATIVE] Step {i+1}/{total_steps}: ({current_dx},{current_dy})")
+                
+                # Небольшая задержка между шагами для игр
+                if i < total_steps - 1:  # не задерживаем после последнего шага
+                    time.sleep(0.001)  # 1ms задержка
+        
+        if DEBUG_CAMERA_MOVEMENT:
+            print(f"[SEND_RELATIVE] Completed: total delta=({dx},{dy}) in {total_steps} steps")
 
 else:
     # На Linux/macOS используем pynput.Controller().move как относительное перемещение
@@ -137,6 +144,11 @@ else:
         dx = int(dx); dy = int(dy)
         if dx == 0 and dy == 0:
             return
+            
+        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: каждый вызов функции
+        if DEBUG_CAMERA_MOVEMENT:
+            print(f"[SEND_RELATIVE LINUX] Called with dx={dx}, dy={dy}")
+            
         steps = max(abs(dx), abs(dy))
         step_x = dx / float(steps)
         step_y = dy / float(steps)
@@ -145,6 +157,8 @@ else:
         prev_ix = 0
         prev_iy = 0
         ctrl = _mouse.Controller()
+        events_sent = 0
+        
         for _ in range(steps):
             cur_x += step_x
             cur_y += step_y
@@ -154,8 +168,12 @@ else:
             sy = iy - prev_iy
             if sx != 0 or sy != 0:
                 ctrl.move(sx, sy)
+                events_sent += 1
                 prev_ix = ix
                 prev_iy = iy
+                
+        if DEBUG_CAMERA_MOVEMENT:
+            print(f"[SEND_RELATIVE LINUX] Total events sent: {events_sent}, final delta=({dx},{dy})")
 
 # Сигналы для безопасного обновления GUI из других потоков
 class WorkerSignals(QObject):
@@ -504,6 +522,9 @@ class MacroApp(QWidget):
         pressed_buttons = set()
         rmb_center = None  # (cx, cy) координаты - текущий центр для дельта-расчета
         last_mouse_pos = None  # Последняя известная позиция мыши
+        
+        if DEBUG_CAMERA_MOVEMENT:
+            self.signals.log_message.emit("[INIT DEBUG] Starting playback with fresh state")
 
         # Обратный отсчет
         for i in range(3, 0, -1):
@@ -537,6 +558,13 @@ class MacroApp(QWidget):
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
 
+                # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: состояние перед каждым событием
+                if DEBUG_CAMERA_MOVEMENT and event_type.startswith('mouse'):
+                    self.signals.log_message.emit(
+                        f"[STATE DEBUG] Before {event_type}: pressed={pressed_buttons} "
+                        f"rmb_center={rmb_center} last_pos={last_mouse_pos}"
+                    )
+
                 try:
                     if event_type == 'mouse_pos':
                         # Исходная позиция только один раз для старта
@@ -548,21 +576,49 @@ class MacroApp(QWidget):
 
                     elif event_type == 'mouse_move':
                         x, y = event_args[0], event_args[1]
-                        if mouse.Button.right in pressed_buttons and rmb_center is not None:
+                        
+                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: состояние кнопок
+                        if DEBUG_CAMERA_MOVEMENT:
+                            rmb_pressed = mouse.Button.right in pressed_buttons
+                            self.signals.log_message.emit(
+                                f"[MOVE DEBUG] pos({x},{y}) RMB={rmb_pressed} rmb_center={rmb_center} "
+                                f"last_pos={last_mouse_pos}"
+                            )
+                        
+                        # БОЛЕЕ НАДЕЖНАЯ ПРОВЕРКА: проверяем состояние ПКМ более тщательно
+                        rmb_pressed = mouse.Button.right in pressed_buttons
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(f"[RMB CHECK] RMB pressed: {rmb_pressed}, rmb_center: {rmb_center}")
+                        
+                        if rmb_pressed and rmb_center is not None:
                             # ПРАВИЛЬНАЯ ЛОГИКА: инкрементальное движение от предыдущей позиции
                             # Используем last_mouse_pos для расчета дельты, а не rmb_center
                             if last_mouse_pos is not None:
                                 dx = int((x - last_mouse_pos[0]) * CAMERA_GAIN)
                                 dy = int((y - last_mouse_pos[1]) * CAMERA_GAIN)
                                 
+                                # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: расчет дельты
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(
+                                        f"[DELTA DEBUG] Calculated: prev({last_mouse_pos[0]},{last_mouse_pos[1]}) "
+                                        f"curr({x},{y}) = delta({dx},{dy}) gain={CAMERA_GAIN}"
+                                    )
+                                
                                 # Отправляем движение если оно значимое
                                 if abs(dx) >= MIN_STEP_THRESHOLD or abs(dy) >= MIN_STEP_THRESHOLD:
                                     if DEBUG_CAMERA_MOVEMENT:
                                         self.signals.log_message.emit(
-                                            f"[CAM DEBUG] RMB incremental: prev({last_mouse_pos[0]},{last_mouse_pos[1]}) "
-                                            f"curr({x},{y}) delta({dx},{dy})"
+                                            f"[SEND DEBUG] Calling send_relative_line({dx}, {dy})"
                                         )
                                     send_relative_line(dx, dy)
+                                else:
+                                    if DEBUG_CAMERA_MOVEMENT:
+                                        self.signals.log_message.emit(
+                                            f"[SKIP DEBUG] Delta too small: ({dx},{dy}) < threshold={MIN_STEP_THRESHOLD}"
+                                        )
+                            else:
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit("[ERROR DEBUG] last_mouse_pos is None during RMB drag!")
                             
                             # НЕ обновляем rmb_center - он остается точкой нажатия ПКМ
                             # НИЧЕГО абсолютного не двигаем, когда ПКМ зажата
@@ -570,12 +626,20 @@ class MacroApp(QWidget):
                             # Вне режима камеры — обычное абсолютное перемещение
                             mouse_controller.position = (x, y)
                             if DEBUG_CAMERA_MOVEMENT and mouse.Button.right not in pressed_buttons:
-                                self.signals.log_message.emit(f"[CAM DEBUG] Normal mouse_move: ({x}, {y})")
+                                self.signals.log_message.emit(f"[NORMAL MOVE] Absolute position: ({x}, {y})")
                         last_mouse_pos = (x, y)
 
                     elif event_type == 'mouse_press':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
                         button = MOUSE_BUTTONS.get(button_str)
+                        
+                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: перед нажатием
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(
+                                f"[PRESS DEBUG] button={button_str} pos({x},{y}) "
+                                f"pressed_before={pressed_buttons}"
+                            )
+                        
                         # Перед нажатием — ставим абсолют, чтобы клик попал
                         mouse_controller.position = (x, y)
                         if button:
@@ -586,18 +650,32 @@ class MacroApp(QWidget):
                                 rmb_center = (x, y)
                                 last_mouse_pos = (x, y)  # Важно для правильного старта инкрементальных расчетов
                                 if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB pressed at: ({x}, {y}), initialized last_mouse_pos")
+                                    self.signals.log_message.emit(
+                                        f"[RMB PRESS DEBUG] RMB pressed at: ({x}, {y}), "
+                                        f"rmb_center={rmb_center}, last_mouse_pos={last_mouse_pos}"
+                                    )
 
                     elif event_type == 'mouse_release':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
                         button = MOUSE_BUTTONS.get(button_str)
+                        
+                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: перед отпусканием
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(
+                                f"[RELEASE DEBUG] button={button_str} pos({x},{y}) "
+                                f"pressed_before={pressed_buttons} rmb_center={rmb_center}"
+                            )
+                        
                         mouse_controller.position = (x, y)
                         if button:
                             mouse_controller.release(button)
                             pressed_buttons.discard(button)
                             if button == mouse.Button.right:
                                 if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(f"[CAM DEBUG] RMB released at: ({x}, {y}), resetting camera state")
+                                    self.signals.log_message.emit(
+                                        f"[RMB RELEASE DEBUG] RMB released at: ({x}, {y}), "
+                                        f"resetting rmb_center from {rmb_center} to None"
+                                    )
                                 rmb_center = None  # сброс «центра» по отпусканию
                                 # last_mouse_pos не сбрасываем - он нужен для следующих движений
 
