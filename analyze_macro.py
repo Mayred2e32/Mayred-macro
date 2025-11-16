@@ -22,7 +22,8 @@ def analyze_macro_file(filename):
         mouse_events = []
         rmb_press_events = []
         rmb_release_events = []
-        rmb_move_events = []
+        rmb_move_absolute = []
+        rmb_move_relative = []
         
         for i, event in enumerate(events):
             event_type, event_args = event
@@ -36,7 +37,9 @@ def analyze_macro_file(filename):
                 elif event_type == 'mouse_release' and event_args[2] == 'Button.right':
                     rmb_release_events.append((i, event_args))
                 elif event_type == 'mouse_move':
-                    rmb_move_events.append((i, event_args))
+                    rmb_move_absolute.append((i, event_args))
+                elif event_type == 'mouse_move_relative':
+                    rmb_move_relative.append((i, event_args))
         
         print(f"\nТипы событий:")
         for event_type, count in event_types.items():
@@ -45,7 +48,8 @@ def analyze_macro_file(filename):
         print(f"\nRMB события:")
         print(f"  RMB нажатий: {len(rmb_press_events)}")
         print(f"  RMB отпусканий: {len(rmb_release_events)}")
-        print(f"  Всего mouse_move: {len(rmb_move_events)}")
+        print(f"  mouse_move (absolute): {len(rmb_move_absolute)}")
+        print(f"  mouse_move_relative: {len(rmb_move_relative)}")
         
         # Анализируем последовательность RMB событий
         if rmb_press_events:
@@ -64,23 +68,50 @@ def analyze_macro_file(filename):
                         
                         # Считаем движения между нажатием и отпусканием
                         moves_in_drag = []
-                        for move_idx, move_args in rmb_move_events:
-                            if press_time < move_args[2] < release_time:
-                                moves_in_drag.append((move_idx, move_args))
+                        for move_idx, move_type, move_args in mouse_events:
+                            if move_type not in ('mouse_move', 'mouse_move_relative'):
+                                continue
+                            move_time = move_args[2]
+                            if press_time < move_time < release_time:
+                                moves_in_drag.append((move_idx, move_type, move_args))
                         
                         print(f"    → Движений во время drag: {len(moves_in_drag)}")
                         
                         if moves_in_drag:
-                            first_move = moves_in_drag[0][1]
-                            last_move = moves_in_drag[-1][1]
-                            total_dx = last_move[0] - first_move[0]
-                            total_dy = last_move[1] - first_move[1]
+                            rel_dx = rel_dy = 0
+                            first_abs = None
+                            last_abs = None
+                            
+                            for _, move_type, move_args in moves_in_drag:
+                                if move_type == 'mouse_move_relative':
+                                    rel_dx += move_args[0]
+                                    rel_dy += move_args[1]
+                                else:
+                                    if first_abs is None:
+                                        first_abs = (move_args[0], move_args[1])
+                                    last_abs = (move_args[0], move_args[1])
+                            
+                            abs_dx = abs_dy = 0
+                            if first_abs is not None and last_abs is not None:
+                                abs_dx = last_abs[0] - first_abs[0]
+                                abs_dy = last_abs[1] - first_abs[1]
+                            
+                            total_dx = rel_dx + abs_dx
+                            total_dy = rel_dy + abs_dy
+                            
                             print(f"    → Общее смещение: ({total_dx}, {total_dy})")
+                            if abs_dx != 0 or abs_dy != 0:
+                                print(f"      Абсолютная компонента: ({abs_dx}, {abs_dy})")
+                            if rel_dx != 0 or rel_dy != 0:
+                                print(f"      Относительная компонента: ({rel_dx}, {rel_dy})")
                             
                             # Показываем первые несколько движений
                             print(f"    → Первые 5 движений:")
-                            for j, (move_idx, move_args) in enumerate(moves_in_drag[:5]):
-                                print(f"      {j+1}. pos({move_args[0]}, {move_args[1]}) time={move_args[2]:.3f}s")
+                            for j, (move_idx, move_type, move_args) in enumerate(moves_in_drag[:5]):
+                                if move_type == 'mouse_move_relative':
+                                    print(f"      {j+1}. Δ({move_args[0]}, {move_args[1]}) time={move_args[2]:.3f}s [relative]")
+                                else:
+                                    print(f"      {j+1}. pos({move_args[0]}, {move_args[1]}) time={move_args[2]:.3f}s [absolute]")
                         
                         break
         

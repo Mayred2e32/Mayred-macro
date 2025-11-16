@@ -1,6 +1,7 @@
 import sys
 import time
 import threading
+import queue
 import json
 import os
 import platform
@@ -135,6 +136,208 @@ if IS_WINDOWS:
         
         if DEBUG_CAMERA_MOVEMENT:
             print(f"[SEND_RELATIVE] Completed: total delta=({dx},{dy}) in {total_steps} steps")
+
+    kernel32 = ctypes.windll.kernel32
+
+    WM_INPUT = 0x00FF
+    RID_INPUT = 0x10000003
+    RIM_TYPEMOUSE = 0
+    RIDEV_INPUTSINK = 0x00000100
+    WM_CLOSE = 0x0010
+    WM_DESTROY = 0x0002
+
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [
+            ("usUsagePage", wintypes.USHORT),
+            ("usUsage", wintypes.USHORT),
+            ("dwFlags", wintypes.DWORD),
+            ("hwndTarget", wintypes.HWND),
+        ]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [
+            ("dwType", wintypes.DWORD),
+            ("dwSize", wintypes.DWORD),
+            ("hDevice", wintypes.HANDLE),
+            ("wParam", wintypes.WPARAM),
+        ]
+
+    class RAWMOUSE(ctypes.Structure):
+        _fields_ = [
+            ("usFlags", wintypes.USHORT),
+            ("ulButtons", wintypes.ULONG),
+            ("usButtonFlags", wintypes.USHORT),
+            ("usButtonData", wintypes.USHORT),
+            ("ulRawButtons", wintypes.ULONG),
+            ("lLastX", wintypes.LONG),
+            ("lLastY", wintypes.LONG),
+            ("ulExtraInformation", wintypes.ULONG),
+        ]
+
+    class RAWINPUTDATA(ctypes.Union):
+        _fields_ = [
+            ("mouse", RAWMOUSE),
+        ]
+
+    class RAWINPUT(ctypes.Structure):
+        _anonymous_ = ("data",)
+        _fields_ = [
+            ("header", RAWINPUTHEADER),
+            ("data", RAWINPUTDATA),
+        ]
+
+    WNDPROC = ctypes.WINFUNCTYPE(
+        wintypes.LRESULT,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
+    class WNDCLASS(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HCURSOR),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    _RAW_LISTENER_INSTANCE = None
+
+    @WNDPROC
+    def _raw_input_wnd_proc(hwnd, msg, wParam, lParam):
+        listener = _RAW_LISTENER_INSTANCE
+        if msg == WM_INPUT and listener is not None:
+            listener._process_raw_input(lParam)
+            return 0
+        if msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+
+    class RawMouseDeltaListener(threading.Thread):
+        def __init__(self):
+            super().__init__(daemon=True)
+            self.queue = queue.Queue()
+            self._stop_event = threading.Event()
+            self._ready_event = threading.Event()
+            self._hwnd = None
+            self._class_name = f"RawInputCapture_{int(time.time()*1000)}"
+            self._error = None
+
+        def run(self):
+            global _RAW_LISTENER_INSTANCE
+            try:
+                self._setup_window()
+            except Exception as exc:
+                self._error = exc
+                self._ready_event.set()
+                return
+            _RAW_LISTENER_INSTANCE = self
+            self._ready_event.set()
+            try:
+                self._message_loop()
+            finally:
+                _RAW_LISTENER_INSTANCE = None
+
+        def _setup_window(self):
+            hInstance = kernel32.GetModuleHandleW(None)
+            wndclass = WNDCLASS()
+            wndclass.style = 0
+            wndclass.lpfnWndProc = _raw_input_wnd_proc
+            wndclass.cbClsExtra = 0
+            wndclass.cbWndExtra = 0
+            wndclass.hInstance = hInstance
+            wndclass.hIcon = None
+            wndclass.hCursor = None
+            wndclass.hbrBackground = None
+            wndclass.lpszMenuName = None
+            wndclass.lpszClassName = self._class_name
+
+            atom = user32.RegisterClassW(ctypes.byref(wndclass))
+            if not atom:
+                err = kernel32.GetLastError()
+                if err != 1410:  # класс уже зарегистрирован
+                    raise ctypes.WinError(err)
+
+            self._hwnd = user32.CreateWindowExW(
+                0,
+                self._class_name,
+                self._class_name,
+                0,
+                0, 0, 0, 0,
+                0,
+                0,
+                hInstance,
+                None
+            )
+            if not self._hwnd:
+                raise ctypes.WinError(kernel32.GetLastError())
+
+            rid = RAWINPUTDEVICE()
+            rid.usUsagePage = 0x01
+            rid.usUsage = 0x02
+            rid.dwFlags = RIDEV_INPUTSINK
+            rid.hwndTarget = self._hwnd
+            if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid)):
+                raise ctypes.WinError(kernel32.GetLastError())
+
+        def _message_loop(self):
+            msg = wintypes.MSG()
+            while not self._stop_event.is_set():
+                ret = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if ret in (0, -1):
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+        def _process_raw_input(self, lparam):
+            size = wintypes.UINT(0)
+            if user32.GetRawInputData(
+                lparam,
+                RID_INPUT,
+                None,
+                ctypes.byref(size),
+                ctypes.sizeof(RAWINPUTHEADER)
+            ) == 0xFFFFFFFF:
+                return
+            if size.value == 0:
+                return
+            buffer = ctypes.create_string_buffer(size.value)
+            if user32.GetRawInputData(
+                lparam,
+                RID_INPUT,
+                buffer,
+                ctypes.byref(size),
+                ctypes.sizeof(RAWINPUTHEADER)
+            ) == 0xFFFFFFFF:
+                return
+            raw = ctypes.cast(buffer, ctypes.POINTER(RAWINPUT)).contents
+            if raw.header.dwType == RIM_TYPEMOUSE:
+                dx = raw.mouse.lLastX
+                dy = raw.mouse.lLastY
+                if dx != 0 or dy != 0:
+                    timestamp = time.perf_counter()
+                    self.queue.put((int(dx), int(dy), timestamp))
+
+        def wait_until_ready(self, timeout=1.0):
+            self._ready_event.wait(timeout)
+            return self._error is None and self._hwnd is not None
+
+        def stop(self):
+            self._stop_event.set()
+            if self._hwnd:
+                user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)
+            self.join(timeout=0.5)
 
 else:
     # На Linux/macOS используем pynput.Controller().move как относительное перемещение
@@ -441,11 +644,62 @@ class MacroApp(QWidget):
         start_time = time.perf_counter()
         def get_offset(): return time.perf_counter() - start_time
         mouse_controller = mouse.Controller()
-        self.recorded_events.append(('mouse_pos', (mouse_controller.position[0], mouse_controller.position[1], 0.0)))
+        initial_pos = (mouse_controller.position[0], mouse_controller.position[1])
+        self.recorded_events.append(('mouse_pos', (initial_pos[0], initial_pos[1], 0.0)))
         
-        # Отслеживание для дебага камеры
-        last_rmb_state = False
+        # Отслеживание состояния и дебаг
+        pressed_buttons = set()
         mouse_move_count = 0
+        raw_move_count = 0
+        last_mouse_pos = initial_pos
+
+        raw_listener = None
+        raw_listener_ready = False
+        if IS_WINDOWS:
+            try:
+                raw_listener = RawMouseDeltaListener()
+                raw_listener.start()
+                raw_listener_ready = raw_listener.wait_until_ready()
+                if DEBUG_CAMERA_MOVEMENT:
+                    status = "готов" if raw_listener_ready else "не запущен"
+                    self.signals.log_message.emit(f"[RAW INIT] Raw input listener {status}")
+                    if not raw_listener_ready and getattr(raw_listener, "_error", None):
+                        self.signals.log_message.emit(f"[RAW INIT ERROR] {raw_listener._error}")
+                if not raw_listener_ready:
+                    raw_listener = None
+            except Exception as e:
+                raw_listener = None
+                raw_listener_ready = False
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(f"[RAW INIT ERROR] {e}")
+
+        def drain_raw_events():
+            nonlocal last_mouse_pos, raw_move_count
+            if not (IS_WINDOWS and raw_listener_ready and raw_listener):
+                return
+            while True:
+                try:
+                    dx, dy, ts = raw_listener.queue.get_nowait()
+                except queue.Empty:
+                    break
+                if dx == 0 and dy == 0:
+                    continue
+                raw_move_count += 1
+                offset = ts - start_time
+                dx_i = int(dx)
+                dy_i = int(dy)
+                if mouse.Button.right in pressed_buttons:
+                    self.recorded_events.append(('mouse_move_relative', (dx_i, dy_i, offset)))
+                    if DEBUG_CAMERA_MOVEMENT and (raw_move_count % 5 == 0 or raw_move_count <= 2):
+                        self.signals.log_message.emit(
+                            f"[RAW REC] Δ({dx_i},{dy_i}) offset={offset:.3f}s"
+                        )
+                    if last_mouse_pos is not None:
+                        last_mouse_pos = (last_mouse_pos[0] + dx_i, last_mouse_pos[1] + dy_i)
+                elif DEBUG_CAMERA_MOVEMENT and raw_move_count % 25 == 0:
+                    self.signals.log_message.emit(
+                        f"[RAW REC] Δ({dx_i},{dy_i}) offset={offset:.3f}s проигнорирован (RMB не зажата)"
+                    )
 
         def on_press(key):
             if not self.is_recording: return
@@ -460,40 +714,94 @@ class MacroApp(QWidget):
             self.recorded_events.append(('key_release', (k, get_offset())))
 
         def on_click(x, y, button, pressed):
-            if not self.is_recording: return
+            nonlocal last_mouse_pos
+            if not self.is_recording:
+                return
             action = 'mouse_press' if pressed else 'mouse_release'
             offset = get_offset()
-            self.recorded_events.append((action, (x, y, str(button), offset)))
+            button_str = str(button)
+            self.recorded_events.append((action, (x, y, button_str, offset)))
+
+            if pressed:
+                if button == mouse.Button.right and IS_WINDOWS and raw_listener_ready:
+                    drain_raw_events()
+                pressed_buttons.add(button)
+            else:
+                if button == mouse.Button.right and IS_WINDOWS and raw_listener_ready:
+                    drain_raw_events()
+                pressed_buttons.discard(button)
+
+            last_mouse_pos = (x, y)
+
             # Логируем нажатие и отпускание кнопок для отладки камеры
             if DEBUG_CAMERA_MOVEMENT:
-                button_name = str(button).replace('Button.', '')
-                if pressed and button_name == 'right':
-                    self.signals.log_message.emit(f"[REC DEBUG] RMB pressed at ({x}, {y}), offset={offset:.3f}s")
-                elif not pressed and button_name == 'right':
-                    self.signals.log_message.emit(f"[REC DEBUG] RMB released at ({x}, {y}), offset={offset:.3f}s")
+                button_name = button_str.replace('Button.', '')
+                if pressed and button == mouse.Button.right:
+                    self.signals.log_message.emit(
+                        f"[REC DEBUG] RMB pressed at ({x}, {y}), offset={offset:.3f}s — switching to relative capture"
+                    )
+                elif not pressed and button == mouse.Button.right:
+                    self.signals.log_message.emit(
+                        f"[REC DEBUG] RMB released at ({x}, {y}), offset={offset:.3f}s — returning to absolute capture"
+                    )
 
         def on_scroll(x, y, dx, dy):
             if not self.is_recording: return
             self.recorded_events.append(('mouse_scroll', (dx, dy, get_offset())))
 
         def on_move(x, y):
-            nonlocal last_rmb_state, mouse_move_count
-            if not self.is_recording: return
+            nonlocal last_mouse_pos, mouse_move_count
+            if not self.is_recording:
+                return
             offset = get_offset()
-            self.recorded_events.append(('mouse_move', (x, y, offset)))
-            
-            # Логируем движение мыши при зажатой ПКМ
-            if DEBUG_CAMERA_MOVEMENT:
-                mouse_move_count += 1
-                # Логируем каждое 5-е движение чтобы не засорить лог
-                if mouse_move_count % 5 == 0:
-                    self.signals.log_message.emit(f"[REC DEBUG] Mouse move #{mouse_move_count}: ({x}, {y}), offset={offset:.3f}s")
+            rmb_pressed = mouse.Button.right in pressed_buttons
+
+            mouse_move_count += 1
+            using_raw = IS_WINDOWS and raw_listener_ready and raw_listener and rmb_pressed
+
+            if rmb_pressed:
+                if using_raw:
+                    drain_raw_events()
+                    if DEBUG_CAMERA_MOVEMENT and mouse_move_count % 10 == 0:
+                        self.signals.log_message.emit(
+                            f"[REC DEBUG] Drain raw queue at offset={offset:.3f}s (RMB held)"
+                        )
+                else:
+                    dx = int(x - last_mouse_pos[0]) if last_mouse_pos is not None else 0
+                    dy = int(y - last_mouse_pos[1]) if last_mouse_pos is not None else 0
+                    if dx != 0 or dy != 0:
+                        self.recorded_events.append(('mouse_move_relative', (dx, dy, offset)))
+                        if DEBUG_CAMERA_MOVEMENT and mouse_move_count % 5 == 0:
+                            self.signals.log_message.emit(
+                                f"[REC DEBUG] Relative move #{mouse_move_count}: Δ({dx}, {dy}) raw=({x}, {y}) offset={offset:.3f}s"
+                            )
+                    elif DEBUG_CAMERA_MOVEMENT and mouse_move_count % 5 == 0:
+                        self.signals.log_message.emit(
+                            f"[REC DEBUG] Relative move #{mouse_move_count}: Δ(0, 0) raw=({x}, {y}) offset={offset:.3f}s (skipped)"
+                        )
+            else:
+                if IS_WINDOWS and raw_listener_ready and raw_listener:
+                    drain_raw_events()
+                self.recorded_events.append(('mouse_move', (x, y, offset)))
+                if DEBUG_CAMERA_MOVEMENT and mouse_move_count % 5 == 0:
+                    self.signals.log_message.emit(
+                        f"[REC DEBUG] Mouse move #{mouse_move_count}: ({x}, {y}), offset={offset:.3f}s"
+                    )
+
+            if not using_raw:
+                last_mouse_pos = (x, y)
 
         k_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         m_listener = mouse.Listener(on_click=on_click, on_scroll=on_scroll, on_move=on_move)
         k_listener.start(); m_listener.start()
-        while self.is_recording: time.sleep(0.1)
+        while self.is_recording:
+            if IS_WINDOWS and raw_listener_ready and raw_listener and mouse.Button.right in pressed_buttons:
+                drain_raw_events()
+            time.sleep(0.05)
         k_listener.stop(); m_listener.stop()
+        if IS_WINDOWS and raw_listener:
+            drain_raw_events()
+            raw_listener.stop()
         self.signals.recording_stopped.emit()
 
     def play_selected_macro(self):
@@ -628,6 +936,41 @@ class MacroApp(QWidget):
                             if DEBUG_CAMERA_MOVEMENT and mouse.Button.right not in pressed_buttons:
                                 self.signals.log_message.emit(f"[NORMAL MOVE] Absolute position: ({x}, {y})")
                         last_mouse_pos = (x, y)
+
+                    elif event_type == 'mouse_move_relative':
+                        raw_dx, raw_dy = int(event_args[0]), int(event_args[1])
+                        rmb_pressed = mouse.Button.right in pressed_buttons
+                        scaled_dx = int(raw_dx * CAMERA_GAIN)
+                        scaled_dy = int(raw_dy * CAMERA_GAIN)
+
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(
+                                f"[REL MOVE DEBUG] raw Δ({raw_dx},{raw_dy}) scaled=({scaled_dx},{scaled_dy}) "
+                                f"RMB={rmb_pressed} last_pos={last_mouse_pos}"
+                            )
+
+                        if rmb_pressed:
+                            if abs(scaled_dx) >= MIN_STEP_THRESHOLD or abs(scaled_dy) >= MIN_STEP_THRESHOLD:
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(
+                                        f"[REL SEND DEBUG] Calling send_relative_line({scaled_dx}, {scaled_dy})"
+                                    )
+                                send_relative_line(scaled_dx, scaled_dy)
+                            else:
+                                if DEBUG_CAMERA_MOVEMENT:
+                                    self.signals.log_message.emit(
+                                        f"[REL SKIP DEBUG] Δ({scaled_dx},{scaled_dy}) < threshold={MIN_STEP_THRESHOLD}"
+                                    )
+                        else:
+                            if DEBUG_CAMERA_MOVEMENT:
+                                self.signals.log_message.emit(
+                                    "[REL WARNING] Received relative movement without RMB pressed; ignoring."
+                                )
+
+                        if last_mouse_pos is not None:
+                            last_mouse_pos = (last_mouse_pos[0] + raw_dx, last_mouse_pos[1] + raw_dy)
+                        else:
+                            last_mouse_pos = (raw_dx, raw_dy)
 
                     elif event_type == 'mouse_press':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
