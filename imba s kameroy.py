@@ -4,6 +4,7 @@ import threading
 import queue
 import json
 import os
+import math
 import platform
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from PySide6.QtCore import Qt, Signal, QObject, QSize
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
-    QTextEdit, QSpinBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect
+    QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect
 )
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon
 
@@ -45,10 +46,139 @@ MOUSE_BUTTONS = {
     'Button.left': mouse.Button.left, 'Button.right': mouse.Button.right, 'Button.middle': mouse.Button.middle,
 }
 
-# --- Настройки симуляции камеры ---
-CAMERA_GAIN = 1.0           # Множитель для чувствительности камеры (1.0 = 100% точность)
+# --- Настройки симуляции камеры и конфиг приложения ---
 MIN_STEP_THRESHOLD = 0    # Минимальный модуль дельты, чтобы отправлять движение
 DEBUG_CAMERA_MOVEMENT = True  # Детальное логирование движений камеры
+
+SETTINGS_FILE = Path(__file__).parent / "settings.json"
+DEFAULT_SETTINGS = {
+    "camera_gain": 1.0,
+    "invert_x": False,
+    "invert_y": False,
+    "sender_max_step": 2,
+    "sender_delay_ms": 2.0,
+    "calibration_target_px": 400.0,
+}
+
+
+def _clamp(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
+
+def _to_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value, default):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def sanitize_settings(raw):
+    if not isinstance(raw, dict):
+        raw = {}
+    data = DEFAULT_SETTINGS.copy()
+    data["camera_gain"] = _clamp(
+        _to_float(raw.get("camera_gain", data["camera_gain"]), data["camera_gain"]),
+        0.3,
+        3.0
+    )
+    data["invert_x"] = _to_bool(raw.get("invert_x", data["invert_x"]))
+    data["invert_y"] = _to_bool(raw.get("invert_y", data["invert_y"]))
+    data["sender_max_step"] = _clamp(
+        _to_int(raw.get("sender_max_step", data["sender_max_step"]), data["sender_max_step"]),
+        1,
+        3
+    )
+    data["sender_delay_ms"] = _clamp(
+        _to_float(raw.get("sender_delay_ms", data["sender_delay_ms"]), data["sender_delay_ms"]),
+        1.0,
+        3.0
+    )
+    data["calibration_target_px"] = _clamp(
+        _to_float(raw.get("calibration_target_px", data["calibration_target_px"]), data["calibration_target_px"]),
+        50.0,
+        2000.0
+    )
+    return data
+
+
+CURRENT_SETTINGS = sanitize_settings(DEFAULT_SETTINGS)
+
+CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]           # Множитель для чувствительности камеры (1.0 = 100% точность)
+INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
+INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
+SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
+SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
+CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
+
+
+class SettingsManager:
+    def __init__(self, path=SETTINGS_FILE):
+        self.path = path
+        self.data = CURRENT_SETTINGS.copy()
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    merged = self.data.copy()
+                    merged.update(raw)
+                    self.data = sanitize_settings(merged)
+                else:
+                    self.data = sanitize_settings(self.data)
+            except Exception as exc:
+                print(f"[SETTINGS] Ошибка загрузки: {exc}")
+                self.data = sanitize_settings(self.data)
+        else:
+            self.data = sanitize_settings(self.data)
+
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+        except Exception as exc:
+            print(f"[SETTINGS] Ошибка сохранения: {exc}")
+
+    def update(self, key, value):
+        updated = self.data.copy()
+        updated[key] = value
+        self.data = sanitize_settings(updated)
+        self.save()
+
+    def get(self, key):
+        return self.data.get(key, DEFAULT_SETTINGS.get(key))
+
+    def as_dict(self):
+        return self.data.copy()
+
+
+def apply_runtime_settings(settings_data):
+    global CURRENT_SETTINGS, CAMERA_GAIN, INVERT_X_AXIS, INVERT_Y_AXIS, SEND_RELATIVE_MAX_STEP, SEND_RELATIVE_DELAY, CALIBRATION_TARGET_PX
+    CURRENT_SETTINGS = sanitize_settings(settings_data)
+    CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]
+    INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
+    INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
+    SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
+    SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
+    CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
+    return CURRENT_SETTINGS
 
 # --- Низкоуровневый хелпер для относительного движения (Windows: SendInput) ---
 IS_WINDOWS = platform.system() == "Windows"
@@ -100,40 +230,50 @@ if IS_WINDOWS:
         return inp
 
     def send_relative_line(dx: int, dy: int):
-        """Улучшенная реализация: разбиваем на маленькие шаги с задержками для игр."""
+        """Отправляет относительное перемещение с учетом настроек разбиения и задержек."""
         dx = int(dx); dy = int(dy)
         if dx == 0 and dy == 0:
             return
 
+        max_step = max(1, int(SEND_RELATIVE_MAX_STEP))
+        delay_seconds = max(0.0, float(SEND_RELATIVE_DELAY))
+
         # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: каждый вызов функции
         if DEBUG_CAMERA_MOVEMENT:
-            print(f"[SEND_RELATIVE] Called with dx={dx}, dy={dy}")
+            print(
+                f"[SEND_RELATIVE] Called with dx={dx}, dy={dy}, max_step={max_step}, "
+                f"delay={delay_seconds * 1000:.3f}ms"
+            )
 
-        # РАЗБИВАЕМ НА МАЛЕНЬКИЕ ШАГИ с задержками
-        # Это помогает играм лучше обрабатывать движения
-        max_step = 3  # максимальный шаг за один раз
-        steps_x = abs(dx) // max_step + (1 if abs(dx) % max_step != 0 else 0)
-        steps_y = abs(dy) // max_step + (1 if abs(dy) % max_step != 0 else 0)
+        steps_x = math.ceil(abs(dx) / max_step) if max_step else 0
+        steps_y = math.ceil(abs(dy) / max_step) if max_step else 0
         total_steps = max(steps_x, steps_y, 1)
-        
+
         step_dx = dx / total_steps
         step_dy = dy / total_steps
-        
-        for i in range(total_steps):
-            current_dx = int(step_dx * (i + 1)) - int(step_dx * i)
-            current_dy = int(step_dy * (i + 1)) - int(step_dy * i)
-            
+
+        prev_dx = 0
+        prev_dy = 0
+
+        for i in range(1, total_steps + 1):
+            target_dx = int(round(step_dx * i))
+            target_dy = int(round(step_dy * i))
+            current_dx = target_dx - prev_dx
+            current_dy = target_dy - prev_dy
+            prev_dx = target_dx
+            prev_dy = target_dy
+
             if current_dx != 0 or current_dy != 0:
                 # Используем mouse_event для лучшей совместимости с играми
                 mouse_event(MOUSEEVENTF_MOVE_OLD, current_dx, current_dy, 0, 0)
-                
+
                 if DEBUG_CAMERA_MOVEMENT:
-                    print(f"[SEND_RELATIVE] Step {i+1}/{total_steps}: ({current_dx},{current_dy})")
-                
-                # Небольшая задержка между шагами для игр
-                if i < total_steps - 1:  # не задерживаем после последнего шага
-                    time.sleep(0.001)  # 1ms задержка
-        
+                    print(f"[SEND_RELATIVE] Step {i}/{total_steps}: ({current_dx},{current_dy})")
+
+                # Регулируем задержку между шагами
+                if i < total_steps and delay_seconds > 0:
+                    time.sleep(delay_seconds)
+
         if DEBUG_CAMERA_MOVEMENT:
             print(f"[SEND_RELATIVE] Completed: total delta=({dx},{dy}) in {total_steps} steps")
 
@@ -347,34 +487,45 @@ else:
         dx = int(dx); dy = int(dy)
         if dx == 0 and dy == 0:
             return
-            
+
+        max_step = max(1, int(SEND_RELATIVE_MAX_STEP))
+        delay_seconds = max(0.0, float(SEND_RELATIVE_DELAY))
+
         # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: каждый вызов функции
         if DEBUG_CAMERA_MOVEMENT:
-            print(f"[SEND_RELATIVE LINUX] Called with dx={dx}, dy={dy}")
-            
-        steps = max(abs(dx), abs(dy))
-        step_x = dx / float(steps)
-        step_y = dy / float(steps)
-        cur_x = 0.0
-        cur_y = 0.0
-        prev_ix = 0
-        prev_iy = 0
+            print(
+                f"[SEND_RELATIVE LINUX] Called with dx={dx}, dy={dy}, max_step={max_step}, "
+                f"delay={delay_seconds * 1000:.3f}ms"
+            )
+
+        steps_x = math.ceil(abs(dx) / max_step)
+        steps_y = math.ceil(abs(dy) / max_step)
+        total_steps = max(steps_x, steps_y, 1)
+
+        step_dx = dx / float(total_steps)
+        step_dy = dy / float(total_steps)
+
+        prev_dx = 0
+        prev_dy = 0
         ctrl = _mouse.Controller()
         events_sent = 0
-        
-        for _ in range(steps):
-            cur_x += step_x
-            cur_y += step_y
-            ix = int(round(cur_x))
-            iy = int(round(cur_y))
-            sx = ix - prev_ix
-            sy = iy - prev_iy
-            if sx != 0 or sy != 0:
-                ctrl.move(sx, sy)
+
+        for i in range(1, total_steps + 1):
+            target_dx = int(round(step_dx * i))
+            target_dy = int(round(step_dy * i))
+            move_x = target_dx - prev_dx
+            move_y = target_dy - prev_dy
+            prev_dx = target_dx
+            prev_dy = target_dy
+
+            if move_x != 0 or move_y != 0:
+                ctrl.move(move_x, move_y)
                 events_sent += 1
-                prev_ix = ix
-                prev_iy = iy
-                
+                if DEBUG_CAMERA_MOVEMENT:
+                    print(f"[SEND_RELATIVE LINUX] Step {i}/{total_steps}: ({move_x},{move_y})")
+                if i < total_steps and delay_seconds > 0:
+                    time.sleep(delay_seconds)
+
         if DEBUG_CAMERA_MOVEMENT:
             print(f"[SEND_RELATIVE LINUX] Total events sent: {events_sent}, final delta=({dx},{dy})")
 
@@ -383,6 +534,8 @@ class WorkerSignals(QObject):
     log_message = Signal(str)
     recording_stopped = Signal()
     playback_finished = Signal()
+    settings_updated = Signal(dict)
+    calibration_finished = Signal()
 
 # --- Основной класс приложения ---
 class MacroApp(QWidget):
@@ -391,6 +544,9 @@ class MacroApp(QWidget):
         self.recorded_events = []
         self.is_recording = False
         self.is_playing = False
+        self._calibration_in_progress = False
+        self.settings_manager = SettingsManager()
+        apply_runtime_settings(self.settings_manager.as_dict())
         self.signals = WorkerSignals()
         os.makedirs(MACROS_DIR, exist_ok=True)
         self._build_ui()
@@ -399,6 +555,11 @@ class MacroApp(QWidget):
         self.signals.log_message.connect(self.log)
         self.signals.recording_stopped.connect(self.on_recording_finished)
         self.signals.playback_finished.connect(self.on_playback_finished)
+        self.signals.settings_updated.connect(self._on_settings_updated)
+        self.signals.calibration_finished.connect(self._on_calibration_finished)
+        self._refresh_settings_controls(self.settings_manager.as_dict())
+        self._update_environment_info()
+        self._update_calibration_ui_state()
         self.log("Приложение готово к работе.")
 
     def _build_ui(self):
@@ -496,6 +657,65 @@ class MacroApp(QWidget):
         form_layout.addRow("Количество повторов:", self.loops_spinbox)
         form_layout.addRow(self.infinite_checkbox)
         settings_panel_layout.addLayout(form_layout)
+
+        settings_panel_layout.addWidget(QLabel("Камера и чувствительность:"))
+        camera_form = QFormLayout()
+        camera_form.setSpacing(10)
+
+        self.camera_gain_spinbox = QDoubleSpinBox()
+        self.camera_gain_spinbox.setRange(0.3, 3.0)
+        self.camera_gain_spinbox.setDecimals(3)
+        self.camera_gain_spinbox.setSingleStep(0.01)
+        self.camera_gain_spinbox.valueChanged.connect(self.on_camera_gain_changed)
+        camera_form.addRow("CAMERA_GAIN:", self.camera_gain_spinbox)
+
+        invert_container = QWidget()
+        invert_layout = QHBoxLayout(invert_container)
+        invert_layout.setContentsMargins(0, 0, 0, 0)
+        invert_layout.setSpacing(10)
+        self.invert_x_checkbox = QCheckBox("Invert X")
+        self.invert_y_checkbox = QCheckBox("Invert Y")
+        self.invert_x_checkbox.stateChanged.connect(self.on_invert_x_changed)
+        self.invert_y_checkbox.stateChanged.connect(self.on_invert_y_changed)
+        invert_layout.addWidget(self.invert_x_checkbox)
+        invert_layout.addWidget(self.invert_y_checkbox)
+        camera_form.addRow("Инверсия осей:", invert_container)
+
+        self.sender_step_spinbox = QSpinBox()
+        self.sender_step_spinbox.setRange(1, 3)
+        self.sender_step_spinbox.valueChanged.connect(self.on_sender_step_changed)
+        camera_form.addRow("Max step (px):", self.sender_step_spinbox)
+
+        self.sender_delay_spinbox = QDoubleSpinBox()
+        self.sender_delay_spinbox.setRange(1.0, 3.0)
+        self.sender_delay_spinbox.setDecimals(3)
+        self.sender_delay_spinbox.setSingleStep(0.1)
+        self.sender_delay_spinbox.valueChanged.connect(self.on_sender_delay_changed)
+        camera_form.addRow("Delay (мс):", self.sender_delay_spinbox)
+
+        self.calibration_target_spinbox = QDoubleSpinBox()
+        self.calibration_target_spinbox.setRange(50.0, 2000.0)
+        self.calibration_target_spinbox.setDecimals(1)
+        self.calibration_target_spinbox.setSingleStep(10.0)
+        self.calibration_target_spinbox.valueChanged.connect(self.on_calibration_target_changed)
+        self.calibrate_button = QPushButton("Автокалибровка")
+        self.calibrate_button.clicked.connect(self.start_autocalibration)
+
+        calibration_container = QWidget()
+        calibration_layout = QHBoxLayout(calibration_container)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_layout.setSpacing(8)
+        calibration_layout.addWidget(self.calibration_target_spinbox)
+        calibration_layout.addWidget(self.calibrate_button)
+        camera_form.addRow("Цель (px):", calibration_container)
+
+        settings_panel_layout.addLayout(camera_form)
+
+        self.environment_label = QLabel()
+        self.environment_label.setWordWrap(True)
+        self.environment_label.setText("Проверка системных параметров...")
+        settings_panel_layout.addWidget(self.environment_label)
+
         right_column.addWidget(settings_panel)
 
         # Лог
@@ -625,9 +845,251 @@ class MacroApp(QWidget):
             shadow.setOffset(0, 2)
             panel.setGraphicsEffect(shadow)
 
+    def _set_spin_value(self, widget, value):
+        if widget is None:
+            return
+        widget.blockSignals(True)
+        widget.setValue(value)
+        widget.blockSignals(False)
+
+    def _set_checkbox_state(self, checkbox, checked):
+        if checkbox is None:
+            return
+        checkbox.blockSignals(True)
+        checkbox.setChecked(checked)
+        checkbox.blockSignals(False)
+
+    def _refresh_settings_controls(self, data=None):
+        if not hasattr(self, "camera_gain_spinbox"):
+            return
+        if data is None:
+            data = self.settings_manager.as_dict()
+        self._set_spin_value(self.camera_gain_spinbox, float(data.get("camera_gain", CAMERA_GAIN)))
+        self._set_checkbox_state(self.invert_x_checkbox, bool(data.get("invert_x", INVERT_X_AXIS)))
+        self._set_checkbox_state(self.invert_y_checkbox, bool(data.get("invert_y", INVERT_Y_AXIS)))
+        self._set_spin_value(self.sender_step_spinbox, int(data.get("sender_max_step", SEND_RELATIVE_MAX_STEP)))
+        self._set_spin_value(self.sender_delay_spinbox, float(data.get("sender_delay_ms", SEND_RELATIVE_DELAY * 1000.0)))
+        self._set_spin_value(self.calibration_target_spinbox, float(data.get("calibration_target_px", CALIBRATION_TARGET_PX)))
+        self._update_calibration_ui_state()
+
+    def _on_settings_updated(self, data):
+        apply_runtime_settings(data)
+        self._refresh_settings_controls(data)
+        self._update_environment_info()
+
+    def _update_setting(self, key, value):
+        current = self.settings_manager.as_dict().get(key)
+        if current == value:
+            return
+        self.settings_manager.update(key, value)
+        self._on_settings_updated(self.settings_manager.as_dict())
+
+    def _on_calibration_finished(self):
+        self._calibration_in_progress = False
+        self._update_calibration_ui_state()
+
+    def _update_calibration_ui_state(self):
+        if hasattr(self, "calibrate_button"):
+            enabled = (not self._calibration_in_progress) and (not self.is_recording) and (not self.is_playing)
+            self.calibrate_button.setEnabled(enabled)
+
+    def _update_environment_info(self):
+        if not hasattr(self, "environment_label"):
+            return
+        messages = []
+        if IS_WINDOWS:
+            scale_info = "Масштаб дисплея: неизвестно"
+            try:
+                dpi = ctypes.windll.user32.GetDpiForSystem()
+                if dpi:
+                    scale = dpi / 96.0
+                    if abs(scale - 1.0) > 0.01:
+                        scale_info = f"⚠️ Масштаб дисплея {scale*100:.0f}% — рекомендуется автокалибровка."
+                    else:
+                        scale_info = "Масштаб дисплея: 100%"
+            except Exception:
+                pass
+            messages.append(scale_info)
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\\Mouse") as key:
+                    mouse_speed, _ = winreg.QueryValueEx(key, "MouseSpeed")
+                if str(mouse_speed) != "0":
+                    messages.append("⚠️ Включена опция «Повысить точность указателя». Автокалибровка обязательна.")
+                else:
+                    messages.append("«Повысить точность указателя» отключена.")
+            except Exception:
+                messages.append("Состояние EPP определить не удалось.")
+            messages.append("Совет: выполняйте автокалибровку при изменении DPI или EPP.")
+        else:
+            messages.append("Среда: не Windows. Автокалибровка использует координаты курсора.")
+        self.environment_label.setText("\n".join(messages))
+
     def log(self, message):
         timestamp = time.strftime("%H:%M:%S")
         self.log_edit.append(f"[{timestamp}] {message}")
+
+    def on_camera_gain_changed(self, value):
+        self._update_setting("camera_gain", float(value))
+        self.log(f"CAMERA_GAIN обновлен до {CAMERA_GAIN:.3f}")
+
+    def on_invert_x_changed(self, state):
+        self._update_setting("invert_x", state == Qt.Checked)
+        self.log("Инверсия оси X " + ("включена" if INVERT_X_AXIS else "выключена"))
+
+    def on_invert_y_changed(self, state):
+        self._update_setting("invert_y", state == Qt.Checked)
+        self.log("Инверсия оси Y " + ("включена" if INVERT_Y_AXIS else "выключена"))
+
+    def on_sender_step_changed(self, value):
+        self._update_setting("sender_max_step", int(value))
+        self.log(f"Максимальный шаг отправки = {SEND_RELATIVE_MAX_STEP}")
+
+    def on_sender_delay_changed(self, value):
+        self._update_setting("sender_delay_ms", float(value))
+        self.log(f"Задержка между шагами = {SEND_RELATIVE_DELAY * 1000:.3f} мс")
+
+    def on_calibration_target_changed(self, value):
+        self._update_setting("calibration_target_px", float(value))
+
+    def start_autocalibration(self):
+        if self.is_recording or self.is_playing:
+            QMessageBox.warning(self, "Автокалибровка", "Остановите запись и воспроизведение перед автокалибровкой.")
+            return
+        if self._calibration_in_progress:
+            return
+        self._calibration_in_progress = True
+        self._update_calibration_ui_state()
+        target = float(self.calibration_target_spinbox.value())
+        self.log(f"Автокалибровка: цель {target:.1f} px. Удерживайте ПКМ и выполните плавный drag.")
+        threading.Thread(target=self._calibration_worker, args=(target,), daemon=True).start()
+
+    def _calibration_worker(self, target_length):
+        raw_listener = None
+        raw_ready = False
+        sum_dx = 0
+        sum_dy = 0
+        event_count = 0
+        first_moves = []
+        pressed = False
+        segment_active = False
+        last_pos = None
+        done_event = threading.Event()
+        listener = None
+        try:
+            if IS_WINDOWS:
+                try:
+                    raw_listener = RawMouseDeltaListener()
+                    raw_listener.start()
+                    raw_ready = raw_listener.wait_until_ready(2.0)
+                    if raw_ready:
+                        self.signals.log_message.emit("[CALIBRATION] RAW Input активен. Отслеживаем чистые дельты.")
+                    else:
+                        self.signals.log_message.emit("[CALIBRATION] RAW Input недоступен, используем координаты курсора.")
+                except Exception as exc:
+                    self.signals.log_message.emit(f"[CALIBRATION] Ошибка запуска RAW Input: {exc}. Используем координаты курсора.")
+                    raw_listener = None
+                    raw_ready = False
+            else:
+                self.signals.log_message.emit("[CALIBRATION] RAW Input недоступен в этой системе. Используем координаты курсора.")
+
+            def drain_raw():
+                nonlocal sum_dx, sum_dy, event_count, first_moves
+                if not (IS_WINDOWS and raw_ready and raw_listener and segment_active):
+                    return
+                while True:
+                    try:
+                        dx, dy, _ = raw_listener.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if dx == 0 and dy == 0:
+                        continue
+                    sum_dx += dx
+                    sum_dy += dy
+                    event_count += 1
+                    if len(first_moves) < 10:
+                        first_moves.append((dx, dy))
+
+            def on_click(x, y, button, pressed_flag):
+                nonlocal pressed, segment_active, last_pos
+                if button != mouse.Button.right:
+                    return
+                if pressed_flag:
+                    pressed = True
+                    segment_active = True
+                    last_pos = (x, y)
+                    drain_raw()
+                    self.signals.log_message.emit("[CALIBRATION] ПКМ зажата — выполняйте drag.")
+                else:
+                    if pressed and IS_WINDOWS and raw_ready:
+                        drain_raw()
+                    pressed = False
+                    segment_active = False
+                    done_event.set()
+                    self.signals.log_message.emit("[CALIBRATION] ПКМ отпущена — завершаем замер.")
+
+            def on_move(x, y):
+                nonlocal last_pos, sum_dx, sum_dy, event_count
+                if not pressed:
+                    last_pos = (x, y)
+                    return
+                if IS_WINDOWS and raw_ready:
+                    drain_raw()
+                else:
+                    if last_pos is not None:
+                        dx = int(round(x - last_pos[0]))
+                        dy = int(round(y - last_pos[1]))
+                        if dx != 0 or dy != 0:
+                            sum_dx += dx
+                            sum_dy += dy
+                            event_count += 1
+                            if len(first_moves) < 10:
+                                first_moves.append((dx, dy))
+                    last_pos = (x, y)
+
+            listener = mouse.Listener(on_click=on_click, on_move=on_move)
+            listener.start()
+
+            timeout_seconds = 15.0
+            start_time = time.perf_counter()
+            while not done_event.is_set() and (time.perf_counter() - start_time) < timeout_seconds:
+                if IS_WINDOWS and raw_ready and pressed:
+                    drain_raw()
+                time.sleep(0.01)
+
+            if not done_event.is_set():
+                self.signals.log_message.emit("[CALIBRATION] Тайм-аут: ПКМ не была отпущена. Используем накопленные данные.")
+
+        except Exception as exc:
+            self.signals.log_message.emit(f"[CALIBRATION] Ошибка: {exc}")
+        finally:
+            if listener is not None:
+                try:
+                    listener.stop()
+                    listener.join()
+                except Exception:
+                    pass
+            if raw_listener:
+                raw_listener.stop()
+
+            total_length = math.hypot(sum_dx, sum_dy)
+            if total_length <= 0.0:
+                self.signals.log_message.emit("[CALIBRATION] Недостаточно движения. Попробуйте ещё раз.")
+            else:
+                current_gain = self.settings_manager.as_dict().get("camera_gain", CAMERA_GAIN)
+                new_gain = target_length / total_length
+                clamped_gain = _clamp(new_gain, 0.3, 3.0)
+                self.settings_manager.update("camera_gain", clamped_gain)
+                self.signals.settings_updated.emit(self.settings_manager.as_dict())
+                self.signals.log_message.emit(
+                    f"[CALIBRATION] Δ=({sum_dx},{sum_dy}), events={event_count}, длина={total_length:.2f}px → "
+                    f"GAIN: {current_gain:.3f} → {clamped_gain:.3f}"
+                )
+                if first_moves:
+                    preview = ", ".join(f"Δ({dx},{dy})" for dx, dy in first_moves[:5])
+                    self.signals.log_message.emit(f"[CALIBRATION] Первые шаги: {preview}")
+
+            self.signals.calibration_finished.emit()
 
     def toggle_recording(self):
         if self.is_recording:
@@ -821,20 +1283,158 @@ class MacroApp(QWidget):
         except Exception as e:
             self.log(f"Ошибка при загрузке макроса: {e}")
 
+
     def play_worker(self, events, loops, name):
         self.update_ui_for_playback(True, name, loops)
         mouse_controller = mouse.Controller()
         keyboard_controller = keyboard.Controller()
 
-        # Состояние кнопок и "центр" для ПКМ
         pressed_buttons = set()
-        rmb_center = None  # (cx, cy) координаты - текущий центр для дельта-расчета
-        last_mouse_pos = None  # Последняя известная позиция мыши
-        
-        if DEBUG_CAMERA_MOVEMENT:
-            self.signals.log_message.emit("[INIT DEBUG] Starting playback with fresh state")
+        last_mouse_pos = None
+        current_segment = None
+        in_rmb_segment = False
 
-        # Обратный отсчет
+        def start_rmb_segment(x, y, offset):
+            nonlocal current_segment, in_rmb_segment, last_mouse_pos
+            in_rmb_segment = True
+            last_mouse_pos = (x, y)
+            current_segment = {
+                "start_offset": offset,
+                "rec_dx": 0,
+                "rec_dy": 0,
+                "sent_dx": 0,
+                "sent_dy": 0,
+                "acc_dx": 0.0,
+                "acc_dy": 0.0,
+                "events": 0,
+                "sent_events": 0,
+                "first_moves": [],
+                "last_offset": offset,
+                "gain": CAMERA_GAIN,
+                "invert_x": INVERT_X_AXIS,
+                "invert_y": INVERT_Y_AXIS,
+                "sender_max_step": SEND_RELATIVE_MAX_STEP,
+                "sender_delay": SEND_RELATIVE_DELAY,
+            }
+            if DEBUG_CAMERA_MOVEMENT:
+                self.signals.log_message.emit(
+                    f"[RMB SEGMENT] start offset={offset:.3f}s pos=({x},{y}) "
+                    f"gain={current_segment['gain']:.3f} invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
+                    f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms)"
+                )
+
+        def process_relative_move(raw_dx, raw_dy, offset):
+            nonlocal last_mouse_pos, current_segment
+            if not in_rmb_segment or current_segment is None:
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[REL WARNING] Δ({raw_dx},{raw_dy}) получено без активного RMB — проигнорировано"
+                    )
+                return
+
+            seg_gain = current_segment['gain']
+            seg_invert_x = current_segment['invert_x']
+            seg_invert_y = current_segment['invert_y']
+
+            current_segment['events'] += 1
+            current_segment['rec_dx'] += raw_dx
+            current_segment['rec_dy'] += raw_dy
+            current_segment['last_offset'] = offset
+            if len(current_segment['first_moves']) < 10:
+                current_segment['first_moves'].append((raw_dx, raw_dy, offset))
+
+            adjusted_dx = raw_dx * seg_gain
+            adjusted_dy = raw_dy * seg_gain
+            if seg_invert_x:
+                adjusted_dx = -adjusted_dx
+            if seg_invert_y:
+                adjusted_dy = -adjusted_dy
+
+            current_segment['acc_dx'] += adjusted_dx
+            current_segment['acc_dy'] += adjusted_dy
+
+            send_dx = int(round(current_segment['acc_dx']))
+            send_dy = int(round(current_segment['acc_dy']))
+
+            if send_dx != 0:
+                current_segment['acc_dx'] -= send_dx
+            if send_dy != 0:
+                current_segment['acc_dy'] -= send_dy
+
+            if send_dx != 0 or send_dy != 0:
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[REL SEND] raw Δ({raw_dx},{raw_dy}) -> sent ({send_dx},{send_dy}); "
+                        f"остаток=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
+                    )
+                send_relative_line(send_dx, send_dy)
+                current_segment['sent_dx'] += send_dx
+                current_segment['sent_dy'] += send_dy
+                current_segment['sent_events'] += 1
+            elif DEBUG_CAMERA_MOVEMENT:
+                self.signals.log_message.emit(
+                    f"[REL ACC] raw Δ({raw_dx},{raw_dy}) накоплено; остаток=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
+                )
+
+            if last_mouse_pos is not None:
+                last_mouse_pos = (last_mouse_pos[0] + raw_dx, last_mouse_pos[1] + raw_dy)
+            else:
+                last_mouse_pos = (raw_dx, raw_dy)
+
+        def finish_rmb_segment(offset):
+            nonlocal current_segment, in_rmb_segment
+            if not in_rmb_segment or current_segment is None:
+                return
+            current_segment['last_offset'] = offset
+
+            flush_dx = int(round(current_segment['acc_dx']))
+            flush_dy = int(round(current_segment['acc_dy']))
+            if flush_dx != 0:
+                current_segment['acc_dx'] -= flush_dx
+            if flush_dy != 0:
+                current_segment['acc_dy'] -= flush_dy
+            if flush_dx != 0 or flush_dy != 0:
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[REL FLUSH] добавляем остаток ({flush_dx},{flush_dy}) перед отпусканием RMB"
+                    )
+                send_relative_line(flush_dx, flush_dy)
+                current_segment['sent_dx'] += flush_dx
+                current_segment['sent_dy'] += flush_dy
+                current_segment['sent_events'] += 1
+
+            duration = 0.0
+            if current_segment['start_offset'] is not None and current_segment['last_offset'] is not None:
+                duration = max(0.0, current_segment['last_offset'] - current_segment['start_offset'])
+            event_rate = current_segment['events'] / duration if duration > 0 else current_segment['events']
+
+            summary = (
+                f"[RMB SUMMARY] duration={duration:.3f}s moves={current_segment['events']} "
+                f"rate={event_rate:.1f}/s raw_sum=({current_segment['rec_dx']},{current_segment['rec_dy']}) "
+                f"sent_sum=({current_segment['sent_dx']},{current_segment['sent_dy']}) "
+                f"gain={current_segment['gain']:.3f} invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
+                f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
+                f"leftover=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
+            )
+            self.signals.log_message.emit(summary)
+
+            if DEBUG_CAMERA_MOVEMENT and current_segment['first_moves']:
+                preview = ", ".join(
+                    f"Δ({dx},{dy})@{move_offset - current_segment['start_offset']:.3f}s"
+                    for dx, dy, move_offset in current_segment['first_moves'][:5]
+                )
+                self.signals.log_message.emit(f"[RMB FIRST Δ] {preview}")
+
+            current_segment = None
+            in_rmb_segment = False
+
+        if DEBUG_CAMERA_MOVEMENT:
+            self.signals.log_message.emit(
+                f"[INIT DEBUG] Starting playback | gain={CAMERA_GAIN:.3f} "
+                f"invert=({int(INVERT_X_AXIS)},{int(INVERT_Y_AXIS)}) "
+                f"sender(max_step={SEND_RELATIVE_MAX_STEP}, delay={SEND_RELATIVE_DELAY * 1000:.3f}ms)"
+            )
+
         for i in range(3, 0, -1):
             if not self.is_playing:
                 self.signals.playback_finished.emit()
@@ -852,8 +1452,10 @@ class MacroApp(QWidget):
                 continue
 
             playback_start_time = time.perf_counter()
-            rmb_center = None  # Сброс центра для каждого цикла
-            last_mouse_pos = None  # Сброс последней позиции для каждого цикла
+            current_segment = None
+            in_rmb_segment = False
+            last_mouse_pos = None
+            last_event_offset = 0.0
 
             for event in events:
                 if not self.is_playing:
@@ -861,21 +1463,19 @@ class MacroApp(QWidget):
 
                 event_type, event_args = event
                 event_offset = event_args[-1]
+                last_event_offset = event_offset
                 target_time = playback_start_time + event_offset
                 sleep_duration = target_time - time.perf_counter()
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
 
-                # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: состояние перед каждым событием
                 if DEBUG_CAMERA_MOVEMENT and event_type.startswith('mouse'):
                     self.signals.log_message.emit(
-                        f"[STATE DEBUG] Before {event_type}: pressed={pressed_buttons} "
-                        f"rmb_center={rmb_center} last_pos={last_mouse_pos}"
+                        f"[STATE DEBUG] Before {event_type}: pressed={pressed_buttons} last_pos={last_mouse_pos} in_rmb={in_rmb_segment}"
                     )
 
                 try:
                     if event_type == 'mouse_pos':
-                        # Исходная позиция только один раз для старта
                         x, y = event_args[0], event_args[1]
                         mouse_controller.position = (x, y)
                         last_mouse_pos = (x, y)
@@ -884,148 +1484,62 @@ class MacroApp(QWidget):
 
                     elif event_type == 'mouse_move':
                         x, y = event_args[0], event_args[1]
-                        
-                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: состояние кнопок
-                        if DEBUG_CAMERA_MOVEMENT:
-                            rmb_pressed = mouse.Button.right in pressed_buttons
-                            self.signals.log_message.emit(
-                                f"[MOVE DEBUG] pos({x},{y}) RMB={rmb_pressed} rmb_center={rmb_center} "
-                                f"last_pos={last_mouse_pos}"
-                            )
-                        
-                        # БОЛЕЕ НАДЕЖНАЯ ПРОВЕРКА: проверяем состояние ПКМ более тщательно
                         rmb_pressed = mouse.Button.right in pressed_buttons
-                        if DEBUG_CAMERA_MOVEMENT:
-                            self.signals.log_message.emit(f"[RMB CHECK] RMB pressed: {rmb_pressed}, rmb_center: {rmb_center}")
-                        
-                        if rmb_pressed and rmb_center is not None:
-                            # ПРАВИЛЬНАЯ ЛОГИКА: инкрементальное движение от предыдущей позиции
-                            # Используем last_mouse_pos для расчета дельты, а не rmb_center
-                            if last_mouse_pos is not None:
-                                dx = int((x - last_mouse_pos[0]) * CAMERA_GAIN)
-                                dy = int((y - last_mouse_pos[1]) * CAMERA_GAIN)
-                                
-                                # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: расчет дельты
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[DELTA DEBUG] Calculated: prev({last_mouse_pos[0]},{last_mouse_pos[1]}) "
-                                        f"curr({x},{y}) = delta({dx},{dy}) gain={CAMERA_GAIN}"
-                                    )
-                                
-                                # Отправляем движение если оно значимое
-                                if abs(dx) >= MIN_STEP_THRESHOLD or abs(dy) >= MIN_STEP_THRESHOLD:
-                                    if DEBUG_CAMERA_MOVEMENT:
-                                        self.signals.log_message.emit(
-                                            f"[SEND DEBUG] Calling send_relative_line({dx}, {dy})"
-                                        )
-                                    send_relative_line(dx, dy)
-                                else:
-                                    if DEBUG_CAMERA_MOVEMENT:
-                                        self.signals.log_message.emit(
-                                            f"[SKIP DEBUG] Delta too small: ({dx},{dy}) < threshold={MIN_STEP_THRESHOLD}"
-                                        )
-                            else:
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit("[ERROR DEBUG] last_mouse_pos is None during RMB drag!")
-                            
-                            # НЕ обновляем rmb_center - он остается точкой нажатия ПКМ
-                            # НИЧЕГО абсолютного не двигаем, когда ПКМ зажата
-                        else:
-                            # Вне режима камеры — обычное абсолютное перемещение
-                            mouse_controller.position = (x, y)
-                            if DEBUG_CAMERA_MOVEMENT and mouse.Button.right not in pressed_buttons:
-                                self.signals.log_message.emit(f"[NORMAL MOVE] Absolute position: ({x}, {y})")
+                        if rmb_pressed and in_rmb_segment:
+                            if DEBUG_CAMERA_MOVEMENT:
+                                self.signals.log_message.emit(
+                                    f"[RMB IGNORE] Absolute move ({x},{y}) пропущен внутри RMB сегмента"
+                                )
+                            continue
+                        mouse_controller.position = (x, y)
                         last_mouse_pos = (x, y)
+                        if DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(f"[NORMAL MOVE] Absolute position: ({x}, {y})")
 
                     elif event_type == 'mouse_move_relative':
                         raw_dx, raw_dy = int(event_args[0]), int(event_args[1])
-                        rmb_pressed = mouse.Button.right in pressed_buttons
-                        scaled_dx = int(raw_dx * CAMERA_GAIN)
-                        scaled_dy = int(raw_dy * CAMERA_GAIN)
-
-                        if DEBUG_CAMERA_MOVEMENT:
-                            self.signals.log_message.emit(
-                                f"[REL MOVE DEBUG] raw Δ({raw_dx},{raw_dy}) scaled=({scaled_dx},{scaled_dy}) "
-                                f"RMB={rmb_pressed} last_pos={last_mouse_pos}"
-                            )
-
-                        if rmb_pressed:
-                            if abs(scaled_dx) >= MIN_STEP_THRESHOLD or abs(scaled_dy) >= MIN_STEP_THRESHOLD:
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[REL SEND DEBUG] Calling send_relative_line({scaled_dx}, {scaled_dy})"
-                                    )
-                                send_relative_line(scaled_dx, scaled_dy)
-                            else:
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[REL SKIP DEBUG] Δ({scaled_dx},{scaled_dy}) < threshold={MIN_STEP_THRESHOLD}"
-                                    )
-                        else:
-                            if DEBUG_CAMERA_MOVEMENT:
-                                self.signals.log_message.emit(
-                                    "[REL WARNING] Received relative movement without RMB pressed; ignoring."
-                                )
-
-                        if last_mouse_pos is not None:
-                            last_mouse_pos = (last_mouse_pos[0] + raw_dx, last_mouse_pos[1] + raw_dy)
-                        else:
-                            last_mouse_pos = (raw_dx, raw_dy)
+                        process_relative_move(raw_dx, raw_dy, event_offset)
 
                     elif event_type == 'mouse_press':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
                         button = MOUSE_BUTTONS.get(button_str)
-                        
-                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: перед нажатием
+
                         if DEBUG_CAMERA_MOVEMENT:
                             self.signals.log_message.emit(
-                                f"[PRESS DEBUG] button={button_str} pos({x},{y}) "
-                                f"pressed_before={pressed_buttons}"
+                                f"[PRESS DEBUG] button={button_str} pos({x},{y}) pressed_before={pressed_buttons}"
                             )
-                        
-                        # Перед нажатием — ставим абсолют, чтобы клик попал
+
                         mouse_controller.position = (x, y)
                         if button:
                             pressed_buttons.add(button)
                             mouse_controller.press(button)
                             if button == mouse.Button.right:
-                                # При нажатии ПКМ устанавливаем центр и инициализируем последнюю позицию
-                                rmb_center = (x, y)
-                                last_mouse_pos = (x, y)  # Важно для правильного старта инкрементальных расчетов
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[RMB PRESS DEBUG] RMB pressed at: ({x}, {y}), "
-                                        f"rmb_center={rmb_center}, last_mouse_pos={last_mouse_pos}"
-                                    )
+                                start_rmb_segment(x, y, event_args[3])
 
                     elif event_type == 'mouse_release':
                         x, y, button_str = event_args[0], event_args[1], event_args[2]
                         button = MOUSE_BUTTONS.get(button_str)
-                        
-                        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: перед отпусканием
+
                         if DEBUG_CAMERA_MOVEMENT:
                             self.signals.log_message.emit(
-                                f"[RELEASE DEBUG] button={button_str} pos({x},{y}) "
-                                f"pressed_before={pressed_buttons} rmb_center={rmb_center}"
+                                f"[RELEASE DEBUG] button={button_str} pos({x},{y}) pressed_before={pressed_buttons}"
                             )
-                        
+
                         mouse_controller.position = (x, y)
                         if button:
+                            if button == mouse.Button.right and in_rmb_segment:
+                                finish_rmb_segment(event_args[3])
                             mouse_controller.release(button)
                             pressed_buttons.discard(button)
                             if button == mouse.Button.right:
-                                if DEBUG_CAMERA_MOVEMENT:
-                                    self.signals.log_message.emit(
-                                        f"[RMB RELEASE DEBUG] RMB released at: ({x}, {y}), "
-                                        f"resetting rmb_center from {rmb_center} to None"
-                                    )
-                                rmb_center = None  # сброс «центра» по отпусканию
-                                # last_mouse_pos не сбрасываем - он нужен для следующих движений
+                                last_mouse_pos = (x, y)
 
                     elif event_type == 'mouse_scroll':
                         mouse_controller.scroll(event_args[0], event_args[1])
                         if DEBUG_CAMERA_MOVEMENT:
-                            self.signals.log_message.emit(f"[CAM DEBUG] Scroll: dx={event_args[0]}, dy={event_args[1]}")
+                            self.signals.log_message.emit(
+                                f"[CAM DEBUG] Scroll: dx={event_args[0]}, dy={event_args[1]}"
+                            )
 
                     elif event_type == 'key_press':
                         key = SPECIAL_KEYS.get(event_args[0]) or event_args[0]
@@ -1037,6 +1551,9 @@ class MacroApp(QWidget):
 
                 except Exception as e:
                     self.signals.log_message.emit(f"Ошибка при воспроизведении: {e}")
+
+            if in_rmb_segment and current_segment is not None:
+                finish_rmb_segment(last_event_offset)
 
             if not self.is_playing:
                 break
@@ -1067,6 +1584,7 @@ class MacroApp(QWidget):
         self.play_button.setEnabled(not is_recording)
         self.save_button.setEnabled(not is_recording)
         self.delete_button.setEnabled(not is_recording)
+        self._update_calibration_ui_state()
 
     def update_ui_for_playback(self, is_playing, name, loops):
         if is_playing:
@@ -1074,6 +1592,7 @@ class MacroApp(QWidget):
         self.play_button.setEnabled(not is_playing)  # фикс синтаксиса (никаких '!' в Python)
         self.record_button.setEnabled(not is_playing)
         self.stop_playback_button.setEnabled(is_playing)
+        self._update_calibration_ui_state()
 
     def save_macro(self):
         if not self.recorded_events:

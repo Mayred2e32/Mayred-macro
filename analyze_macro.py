@@ -4,143 +4,115 @@
 """
 
 import json
-import time
+import math
 from pathlib import Path
 
 def analyze_macro_file(filename):
-    """Анализирует сохраненный макрос файл"""
     print(f"\n=== АНАЛИЗ ФАЙЛА: {filename} ===")
-    
+
     try:
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf-8') as f:
             events = json.load(f)
-        
+
         print(f"Всего событий: {len(events)}")
-        
-        # Анализируем типы событий
+
         event_types = {}
-        mouse_events = []
-        rmb_press_events = []
-        rmb_release_events = []
-        rmb_move_absolute = []
-        rmb_move_relative = []
-        
-        for i, event in enumerate(events):
-            event_type, event_args = event
+        for event_type, _ in events:
             event_types[event_type] = event_types.get(event_type, 0) + 1
-            
-            if event_type.startswith('mouse'):
-                mouse_events.append((i, event_type, event_args))
-                
-                if event_type == 'mouse_press' and event_args[2] == 'Button.right':
-                    rmb_press_events.append((i, event_args))
-                elif event_type == 'mouse_release' and event_args[2] == 'Button.right':
-                    rmb_release_events.append((i, event_args))
-                elif event_type == 'mouse_move':
-                    rmb_move_absolute.append((i, event_args))
-                elif event_type == 'mouse_move_relative':
-                    rmb_move_relative.append((i, event_args))
-        
-        print(f"\nТипы событий:")
-        for event_type, count in event_types.items():
+
+        print("\nТипы событий:")
+        for event_type, count in sorted(event_types.items()):
             print(f"  {event_type}: {count}")
-        
-        print(f"\nRMB события:")
-        print(f"  RMB нажатий: {len(rmb_press_events)}")
-        print(f"  RMB отпусканий: {len(rmb_release_events)}")
-        print(f"  mouse_move (absolute): {len(rmb_move_absolute)}")
-        print(f"  mouse_move_relative: {len(rmb_move_relative)}")
-        
-        # Анализируем последовательность RMB событий
-        if rmb_press_events:
-            print(f"\nАнализ RMB drag последовательностей:")
-            for press_idx, press_args in rmb_press_events:
-                press_time = press_args[3]
-                print(f"  RMB нажатие #{press_idx} в времени {press_time:.3f}s на позиции ({press_args[0]}, {press_args[1]})")
-                
-                # Ищем соответствующее отпускание
-                for release_idx, release_args in rmb_release_events:
-                    if release_args[3] > press_time:
-                        release_time = release_args[3]
-                        duration = release_time - press_time
-                        print(f"    → RMB отпускание #{release_idx} в времени {release_time:.3f}s на позиции ({release_args[0]}, {release_args[1]})")
-                        print(f"    → Длительность: {duration:.3f}s")
-                        
-                        # Считаем движения между нажатием и отпусканием
-                        moves_in_drag = []
-                        for move_idx, move_type, move_args in mouse_events:
-                            if move_type not in ('mouse_move', 'mouse_move_relative'):
-                                continue
-                            move_time = move_args[2]
-                            if press_time < move_time < release_time:
-                                moves_in_drag.append((move_idx, move_type, move_args))
-                        
-                        print(f"    → Движений во время drag: {len(moves_in_drag)}")
-                        
-                        if moves_in_drag:
-                            rel_dx = rel_dy = 0
-                            first_abs = None
-                            last_abs = None
-                            
-                            for _, move_type, move_args in moves_in_drag:
-                                if move_type == 'mouse_move_relative':
-                                    rel_dx += move_args[0]
-                                    rel_dy += move_args[1]
-                                else:
-                                    if first_abs is None:
-                                        first_abs = (move_args[0], move_args[1])
-                                    last_abs = (move_args[0], move_args[1])
-                            
-                            abs_dx = abs_dy = 0
-                            if first_abs is not None and last_abs is not None:
-                                abs_dx = last_abs[0] - first_abs[0]
-                                abs_dy = last_abs[1] - first_abs[1]
-                            
-                            total_dx = rel_dx + abs_dx
-                            total_dy = rel_dy + abs_dy
-                            
-                            print(f"    → Общее смещение: ({total_dx}, {total_dy})")
-                            if abs_dx != 0 or abs_dy != 0:
-                                print(f"      Абсолютная компонента: ({abs_dx}, {abs_dy})")
-                            if rel_dx != 0 or rel_dy != 0:
-                                print(f"      Относительная компонента: ({rel_dx}, {rel_dy})")
-                            
-                            # Показываем первые несколько движений
-                            print(f"    → Первые 5 движений:")
-                            for j, (move_idx, move_type, move_args) in enumerate(moves_in_drag[:5]):
-                                if move_type == 'mouse_move_relative':
-                                    print(f"      {j+1}. Δ({move_args[0]}, {move_args[1]}) time={move_args[2]:.3f}s [relative]")
-                                else:
-                                    print(f"      {j+1}. pos({move_args[0]}, {move_args[1]}) time={move_args[2]:.3f}s [absolute]")
-                        
-                        break
-        
-        # Проверяем временные интервалы
+
+        segments = []
+        current_segment = None
+
+        for idx, (event_type, event_args) in enumerate(events):
+            if event_type == 'mouse_press' and len(event_args) >= 4 and event_args[2] == 'Button.right':
+                current_segment = {
+                    'press_idx': idx,
+                    'press_time': event_args[-1],
+                    'press_pos': (event_args[0], event_args[1]),
+                    'relative_moves': [],
+                    'absolute_moves': [],
+                }
+            elif event_type == 'mouse_move_relative' and current_segment:
+                current_segment['relative_moves'].append((idx, event_args))
+            elif event_type == 'mouse_move' and current_segment:
+                current_segment['absolute_moves'].append((idx, event_args))
+            elif event_type == 'mouse_release' and len(event_args) >= 4 and event_args[2] == 'Button.right' and current_segment:
+                current_segment['release_idx'] = idx
+                current_segment['release_time'] = event_args[-1]
+                current_segment['release_pos'] = (event_args[0], event_args[1])
+                segments.append(current_segment)
+                current_segment = None
+
+        if not segments:
+            print("\nПКМ-сегменты не найдены.")
+        else:
+            print(f"\nНайдено ПКМ-сегментов: {len(segments)}")
+            for seg_idx, segment in enumerate(segments, 1):
+                press_time = segment.get('press_time')
+                release_time = segment.get('release_time')
+                duration = (release_time - press_time) if (press_time is not None and release_time is not None) else None
+                rel_moves = segment['relative_moves']
+                abs_moves = segment['absolute_moves']
+
+                rel_sum_dx = sum(args[0] for _, args in rel_moves)
+                rel_sum_dy = sum(args[1] for _, args in rel_moves)
+                rel_length = math.hypot(rel_sum_dx, rel_sum_dy)
+                rel_rate = (len(rel_moves) / duration) if duration and duration > 0 else len(rel_moves)
+
+                print(f"\n--- ПКМ сегмент #{seg_idx} ---")
+                print(f"  Индексы событий: press={segment['press_idx']} → release={segment.get('release_idx')}")
+                if duration is not None:
+                    print(f"  Длительность: {duration:.4f} с")
+                print(f"  Относительных движений: {len(rel_moves)} (частота {rel_rate:.1f}/с)")
+                print(f"    Сумма Δ: ({rel_sum_dx}, {rel_sum_dy}), длина={rel_length:.2f} px")
+
+                if len(rel_moves) > 1:
+                    intervals = [rel_moves[i + 1][1][2] - rel_moves[i][1][2] for i in range(len(rel_moves) - 1)]
+                    avg_interval = sum(intervals) / len(intervals)
+                    print(
+                        f"    Интервалы: min={min(intervals):.4f} с, max={max(intervals):.4f} с, avg={avg_interval:.4f} с"
+                    )
+
+                if rel_moves:
+                    print("    Первые дельты:")
+                    for idx_move, (move_idx, move_args) in enumerate(rel_moves[:10], 1):
+                        move_time = move_args[2]
+                        rel_time = (move_time - press_time) if press_time is not None else move_time
+                        print(
+                            f"      #{idx_move}: Δ({move_args[0]},{move_args[1]}) @ {rel_time:.4f} с (event #{move_idx})"
+                        )
+
+                if abs_moves:
+                    print(f"  Абсолютных движений в сегменте: {len(abs_moves)}")
+                    first_abs = abs_moves[0][1]
+                    last_abs = abs_moves[-1][1]
+                    abs_dx = last_abs[0] - first_abs[0]
+                    abs_dy = last_abs[1] - first_abs[1]
+                    print(f"    Сумма абсолютных сдвигов: ({abs_dx}, {abs_dy})")
+
         if len(events) > 1:
-            print(f"\nАнализ временных интервалов:")
             intervals = []
             for i in range(1, len(events)):
-                prev_time = events[i-1][1][-1]
+                prev_time = events[i - 1][1][-1]
                 curr_time = events[i][1][-1]
-                interval = curr_time - prev_time
-                intervals.append(interval)
-            
+                intervals.append(curr_time - prev_time)
+
             if intervals:
-                min_interval = min(intervals)
-                max_interval = max(intervals)
-                avg_interval = sum(intervals) / len(intervals)
-                print(f"  Минимальный интервал: {min_interval:.6f}s")
-                print(f"  Максимальный интервал: {max_interval:.6f}s")
-                print(f"  Средний интервал: {avg_interval:.6f}s")
-                
-                # Показываем самые короткие интервалы (возможно проблема)
+                print("\nАнализ временных интервалов (между последовательными событиями):")
+                print(f"  Минимальный интервал: {min(intervals):.6f} с")
+                print(f"  Максимальный интервал: {max(intervals):.6f} с")
+                print(f"  Средний интервал: {sum(intervals) / len(intervals):.6f} с")
                 short_intervals = [(i, interval) for i, interval in enumerate(intervals) if interval < 0.001]
                 if short_intervals:
                     print(f"  Интервалы < 1мс: {len(short_intervals)}")
                     for i, interval in short_intervals[:5]:
-                        event_type = events[i+1][0]
-                        print(f"    Событие {i+1} ({event_type}): {interval:.6f}s")
-    
+                        event_type = events[i + 1][0]
+                        print(f"    Событие {i + 1} ({event_type}): {interval:.6f} с")
+
     except Exception as e:
         print(f"Ошибка при анализе файла: {e}")
 
