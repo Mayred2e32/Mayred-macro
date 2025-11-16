@@ -7,6 +7,7 @@ import os
 import math
 import platform
 from pathlib import Path
+from collections import deque
 
 # --- Импорты для GUI (PySide6) ---
 from PySide6.QtCore import Qt, Signal, QObject, QSize
@@ -53,11 +54,16 @@ DEBUG_CAMERA_MOVEMENT = True  # Детальное логирование дви
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
 DEFAULT_SETTINGS = {
     "camera_gain": 1.0,
+    "gain_x": 1.0,
+    "gain_y": 1.0,
     "invert_x": False,
     "invert_y": False,
-    "sender_max_step": 2,
-    "sender_delay_ms": 2.0,
+    "sender_max_step": 1,
+    "sender_delay_ms": 3.0,
     "calibration_target_px": 400.0,
+    "deadzone_threshold": 0.5,
+    "reverse_window_ms": 40.0,
+    "reverse_tiny_ratio": 0.1,
 }
 
 
@@ -96,16 +102,26 @@ def sanitize_settings(raw):
         0.3,
         3.0
     )
+    data["gain_x"] = _clamp(
+        _to_float(raw.get("gain_x", data["gain_x"]), data["gain_x"]),
+        0.25,
+        4.0
+    )
+    data["gain_y"] = _clamp(
+        _to_float(raw.get("gain_y", data["gain_y"]), data["gain_y"]),
+        0.25,
+        4.0
+    )
     data["invert_x"] = _to_bool(raw.get("invert_x", data["invert_x"]))
     data["invert_y"] = _to_bool(raw.get("invert_y", data["invert_y"]))
     data["sender_max_step"] = _clamp(
         _to_int(raw.get("sender_max_step", data["sender_max_step"]), data["sender_max_step"]),
         1,
-        3
+        2
     )
     data["sender_delay_ms"] = _clamp(
         _to_float(raw.get("sender_delay_ms", data["sender_delay_ms"]), data["sender_delay_ms"]),
-        1.0,
+        2.0,
         3.0
     )
     data["calibration_target_px"] = _clamp(
@@ -113,17 +129,40 @@ def sanitize_settings(raw):
         50.0,
         2000.0
     )
+    data["deadzone_threshold"] = _clamp(
+        _to_float(raw.get("deadzone_threshold", data["deadzone_threshold"]), data["deadzone_threshold"]),
+        0.0,
+        2.0
+    )
+    data["reverse_window_ms"] = _clamp(
+        _to_float(raw.get("reverse_window_ms", data["reverse_window_ms"]), data["reverse_window_ms"]),
+        10.0,
+        120.0
+    )
+    data["reverse_tiny_ratio"] = _clamp(
+        _to_float(raw.get("reverse_tiny_ratio", data["reverse_tiny_ratio"]), data["reverse_tiny_ratio"]),
+        0.01,
+        0.5
+    )
     return data
 
 
 CURRENT_SETTINGS = sanitize_settings(DEFAULT_SETTINGS)
 
-CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]           # Множитель для чувствительности камеры (1.0 = 100% точность)
+CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]           # Общий множитель чувствительности камеры
+GAIN_X_MULTIPLIER = CURRENT_SETTINGS["gain_x"]
+GAIN_Y_MULTIPLIER = CURRENT_SETTINGS["gain_y"]
+CAMERA_GAIN_X = CAMERA_GAIN * GAIN_X_MULTIPLIER
+CAMERA_GAIN_Y = CAMERA_GAIN * GAIN_Y_MULTIPLIER
 INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
 INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
 SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
 SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
 CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
+DEADZONE_THRESHOLD = CURRENT_SETTINGS["deadzone_threshold"]
+REVERSE_WINDOW_MS = CURRENT_SETTINGS["reverse_window_ms"]
+REVERSE_WINDOW_SECONDS = REVERSE_WINDOW_MS / 1000.0
+REVERSE_TINY_RATIO = CURRENT_SETTINGS["reverse_tiny_ratio"]
 
 
 class SettingsManager:
@@ -170,14 +209,25 @@ class SettingsManager:
 
 
 def apply_runtime_settings(settings_data):
-    global CURRENT_SETTINGS, CAMERA_GAIN, INVERT_X_AXIS, INVERT_Y_AXIS, SEND_RELATIVE_MAX_STEP, SEND_RELATIVE_DELAY, CALIBRATION_TARGET_PX
+    global CURRENT_SETTINGS, CAMERA_GAIN, GAIN_X_MULTIPLIER, GAIN_Y_MULTIPLIER
+    global CAMERA_GAIN_X, CAMERA_GAIN_Y, INVERT_X_AXIS, INVERT_Y_AXIS
+    global SEND_RELATIVE_MAX_STEP, SEND_RELATIVE_DELAY, CALIBRATION_TARGET_PX
+    global DEADZONE_THRESHOLD, REVERSE_WINDOW_MS, REVERSE_WINDOW_SECONDS, REVERSE_TINY_RATIO
     CURRENT_SETTINGS = sanitize_settings(settings_data)
     CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]
+    GAIN_X_MULTIPLIER = CURRENT_SETTINGS["gain_x"]
+    GAIN_Y_MULTIPLIER = CURRENT_SETTINGS["gain_y"]
+    CAMERA_GAIN_X = CAMERA_GAIN * GAIN_X_MULTIPLIER
+    CAMERA_GAIN_Y = CAMERA_GAIN * GAIN_Y_MULTIPLIER
     INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
     INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
     SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
     SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
     CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
+    DEADZONE_THRESHOLD = CURRENT_SETTINGS["deadzone_threshold"]
+    REVERSE_WINDOW_MS = CURRENT_SETTINGS["reverse_window_ms"]
+    REVERSE_WINDOW_SECONDS = REVERSE_WINDOW_MS / 1000.0
+    REVERSE_TINY_RATIO = CURRENT_SETTINGS["reverse_tiny_ratio"]
     return CURRENT_SETTINGS
 
 # --- Низкоуровневый хелпер для относительного движения (Windows: SendInput) ---
@@ -669,6 +719,20 @@ class MacroApp(QWidget):
         self.camera_gain_spinbox.valueChanged.connect(self.on_camera_gain_changed)
         camera_form.addRow("CAMERA_GAIN:", self.camera_gain_spinbox)
 
+        self.gain_x_spinbox = QDoubleSpinBox()
+        self.gain_x_spinbox.setRange(0.25, 4.0)
+        self.gain_x_spinbox.setDecimals(3)
+        self.gain_x_spinbox.setSingleStep(0.01)
+        self.gain_x_spinbox.valueChanged.connect(self.on_gain_x_changed)
+        camera_form.addRow("GAIN X:", self.gain_x_spinbox)
+
+        self.gain_y_spinbox = QDoubleSpinBox()
+        self.gain_y_spinbox.setRange(0.25, 4.0)
+        self.gain_y_spinbox.setDecimals(3)
+        self.gain_y_spinbox.setSingleStep(0.01)
+        self.gain_y_spinbox.valueChanged.connect(self.on_gain_y_changed)
+        camera_form.addRow("GAIN Y:", self.gain_y_spinbox)
+
         invert_container = QWidget()
         invert_layout = QHBoxLayout(invert_container)
         invert_layout.setContentsMargins(0, 0, 0, 0)
@@ -681,13 +745,34 @@ class MacroApp(QWidget):
         invert_layout.addWidget(self.invert_y_checkbox)
         camera_form.addRow("Инверсия осей:", invert_container)
 
+        self.deadzone_spinbox = QDoubleSpinBox()
+        self.deadzone_spinbox.setRange(0.0, 2.0)
+        self.deadzone_spinbox.setDecimals(3)
+        self.deadzone_spinbox.setSingleStep(0.05)
+        self.deadzone_spinbox.valueChanged.connect(self.on_deadzone_changed)
+        camera_form.addRow("Deadzone (px):", self.deadzone_spinbox)
+
+        self.reverse_window_spinbox = QDoubleSpinBox()
+        self.reverse_window_spinbox.setRange(10.0, 120.0)
+        self.reverse_window_spinbox.setDecimals(1)
+        self.reverse_window_spinbox.setSingleStep(1.0)
+        self.reverse_window_spinbox.valueChanged.connect(self.on_reverse_window_changed)
+        camera_form.addRow("Suppress window (мс):", self.reverse_window_spinbox)
+
+        self.reverse_ratio_spinbox = QDoubleSpinBox()
+        self.reverse_ratio_spinbox.setRange(0.01, 0.5)
+        self.reverse_ratio_spinbox.setDecimals(3)
+        self.reverse_ratio_spinbox.setSingleStep(0.01)
+        self.reverse_ratio_spinbox.valueChanged.connect(self.on_reverse_ratio_changed)
+        camera_form.addRow("Tiny reverse ratio:", self.reverse_ratio_spinbox)
+
         self.sender_step_spinbox = QSpinBox()
-        self.sender_step_spinbox.setRange(1, 3)
+        self.sender_step_spinbox.setRange(1, 2)
         self.sender_step_spinbox.valueChanged.connect(self.on_sender_step_changed)
         camera_form.addRow("Max step (px):", self.sender_step_spinbox)
 
         self.sender_delay_spinbox = QDoubleSpinBox()
-        self.sender_delay_spinbox.setRange(1.0, 3.0)
+        self.sender_delay_spinbox.setRange(2.0, 3.0)
         self.sender_delay_spinbox.setDecimals(3)
         self.sender_delay_spinbox.setSingleStep(0.1)
         self.sender_delay_spinbox.valueChanged.connect(self.on_sender_delay_changed)
@@ -865,8 +950,13 @@ class MacroApp(QWidget):
         if data is None:
             data = self.settings_manager.as_dict()
         self._set_spin_value(self.camera_gain_spinbox, float(data.get("camera_gain", CAMERA_GAIN)))
+        self._set_spin_value(self.gain_x_spinbox, float(data.get("gain_x", GAIN_X_MULTIPLIER)))
+        self._set_spin_value(self.gain_y_spinbox, float(data.get("gain_y", GAIN_Y_MULTIPLIER)))
         self._set_checkbox_state(self.invert_x_checkbox, bool(data.get("invert_x", INVERT_X_AXIS)))
         self._set_checkbox_state(self.invert_y_checkbox, bool(data.get("invert_y", INVERT_Y_AXIS)))
+        self._set_spin_value(self.deadzone_spinbox, float(data.get("deadzone_threshold", DEADZONE_THRESHOLD)))
+        self._set_spin_value(self.reverse_window_spinbox, float(data.get("reverse_window_ms", REVERSE_WINDOW_MS)))
+        self._set_spin_value(self.reverse_ratio_spinbox, float(data.get("reverse_tiny_ratio", REVERSE_TINY_RATIO)))
         self._set_spin_value(self.sender_step_spinbox, int(data.get("sender_max_step", SEND_RELATIVE_MAX_STEP)))
         self._set_spin_value(self.sender_delay_spinbox, float(data.get("sender_delay_ms", SEND_RELATIVE_DELAY * 1000.0)))
         self._set_spin_value(self.calibration_target_spinbox, float(data.get("calibration_target_px", CALIBRATION_TARGET_PX)))
@@ -931,7 +1021,35 @@ class MacroApp(QWidget):
 
     def on_camera_gain_changed(self, value):
         self._update_setting("camera_gain", float(value))
-        self.log(f"CAMERA_GAIN обновлен до {CAMERA_GAIN:.3f}")
+        self.log(
+            f"CAMERA_GAIN = {CAMERA_GAIN:.3f} → X={CAMERA_GAIN_X:.3f}, Y={CAMERA_GAIN_Y:.3f}"
+        )
+
+    def on_gain_x_changed(self, value):
+        self._update_setting("gain_x", float(value))
+        self.log(
+            f"GAIN X множитель = {GAIN_X_MULTIPLIER:.3f} (эффективное X={CAMERA_GAIN_X:.3f})"
+        )
+
+    def on_gain_y_changed(self, value):
+        self._update_setting("gain_y", float(value))
+        self.log(
+            f"GAIN Y множитель = {GAIN_Y_MULTIPLIER:.3f} (эффективное Y={CAMERA_GAIN_Y:.3f})"
+        )
+
+    def on_deadzone_changed(self, value):
+        self._update_setting("deadzone_threshold", float(value))
+        self.log(f"Deadzone = {DEADZONE_THRESHOLD:.3f} px")
+
+    def on_reverse_window_changed(self, value):
+        self._update_setting("reverse_window_ms", float(value))
+        self.log(f"Окно подавления реверсов = {REVERSE_WINDOW_MS:.1f} мс")
+
+    def on_reverse_ratio_changed(self, value):
+        self._update_setting("reverse_tiny_ratio", float(value))
+        self.log(
+            f"Порог tiny reverse = {REVERSE_TINY_RATIO * 100:.1f}% от среднего шага"
+        )
 
     def on_invert_x_changed(self, state):
         self._update_setting("invert_x", state == Qt.Checked)
@@ -1073,17 +1191,38 @@ class MacroApp(QWidget):
                 raw_listener.stop()
 
             total_length = math.hypot(sum_dx, sum_dy)
-            if total_length <= 0.0:
+            abs_dx = abs(sum_dx)
+            abs_dy = abs(sum_dy)
+            dominant_axis = 'x' if abs_dx >= abs_dy else 'y'
+            observed = abs_dx if dominant_axis == 'x' else abs_dy
+
+            if observed <= 0.0:
                 self.signals.log_message.emit("[CALIBRATION] Недостаточно движения. Попробуйте ещё раз.")
             else:
-                current_gain = self.settings_manager.as_dict().get("camera_gain", CAMERA_GAIN)
-                new_gain = target_length / total_length
-                clamped_gain = _clamp(new_gain, 0.3, 3.0)
-                self.settings_manager.update("camera_gain", clamped_gain)
-                self.signals.settings_updated.emit(self.settings_manager.as_dict())
+                settings_snapshot = self.settings_manager.as_dict()
+                master_gain = settings_snapshot.get("camera_gain", CAMERA_GAIN)
+                if master_gain <= 0:
+                    master_gain = CAMERA_GAIN if CAMERA_GAIN > 0 else 1.0
+                axis_key = "gain_x" if dominant_axis == 'x' else "gain_y"
+                old_multiplier = settings_snapshot.get(
+                    axis_key,
+                    GAIN_X_MULTIPLIER if dominant_axis == 'x' else GAIN_Y_MULTIPLIER,
+                )
+                target_effective = target_length / observed
+                new_multiplier = _clamp(target_effective / master_gain, 0.25, 4.0)
+                self.settings_manager.update(axis_key, new_multiplier)
+                updated_settings = self.settings_manager.as_dict()
+                self.signals.settings_updated.emit(updated_settings)
+                effective_after = master_gain * new_multiplier
+                axis_label = axis_key.upper()
+                clamped_note = ""
+                if abs(effective_after - target_effective) > 1e-6:
+                    clamped_note = " (ограничено диапазоном)"
                 self.signals.log_message.emit(
-                    f"[CALIBRATION] Δ=({sum_dx},{sum_dy}), events={event_count}, длина={total_length:.2f}px → "
-                    f"GAIN: {current_gain:.3f} → {clamped_gain:.3f}"
+                    f"[CALIBRATION] Δ=({sum_dx},{sum_dy}), axis={dominant_axis.upper()}, events={event_count}, "
+                    f"длина={total_length:.2f}px, наблюд. амплитуда={observed:.2f}px → "
+                    f"{axis_label} множитель: {old_multiplier:.3f} → {new_multiplier:.3f} "
+                    f"(эффективное {effective_after:.3f}, целевое {target_effective:.3f}){clamped_note}"
                 )
                 if first_moves:
                     preview = ", ".join(f"Δ({dx},{dy})" for dx, dy in first_moves[:5])
@@ -1310,18 +1449,103 @@ class MacroApp(QWidget):
                 "sent_events": 0,
                 "first_moves": [],
                 "last_offset": offset,
-                "gain": CAMERA_GAIN,
+                "gain_master": CAMERA_GAIN,
+                "gain_x": CAMERA_GAIN_X,
+                "gain_y": CAMERA_GAIN_Y,
+                "gain_x_multiplier": GAIN_X_MULTIPLIER,
+                "gain_y_multiplier": GAIN_Y_MULTIPLIER,
                 "invert_x": INVERT_X_AXIS,
                 "invert_y": INVERT_Y_AXIS,
                 "sender_max_step": SEND_RELATIVE_MAX_STEP,
                 "sender_delay": SEND_RELATIVE_DELAY,
+                "deadzone": DEADZONE_THRESHOLD,
+                "reverse_window_sec": REVERSE_WINDOW_SECONDS,
+                "reverse_ratio": REVERSE_TINY_RATIO,
+                "recent_x": deque(),
+                "recent_y": deque(),
+                "raw_events_x": 0,
+                "raw_events_y": 0,
+                "deadzone_skipped_x": 0,
+                "deadzone_skipped_y": 0,
+                "reverse_suppressed_x": 0,
+                "reverse_suppressed_y": 0,
+                "abs_sum_processed_x": 0.0,
+                "abs_sum_processed_y": 0.0,
             }
             if DEBUG_CAMERA_MOVEMENT:
                 self.signals.log_message.emit(
                     f"[RMB SEGMENT] start offset={offset:.3f}s pos=({x},{y}) "
-                    f"gain={current_segment['gain']:.3f} invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
-                    f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms)"
+                    f"gains(master={current_segment['gain_master']:.3f}, x={current_segment['gain_x']:.3f}, y={current_segment['gain_y']:.3f}) "
+                    f"invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
+                    f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
+                    f"deadzone={current_segment['deadzone']:.3f} window={current_segment['reverse_window_sec'] * 1000:.1f}ms "
+                    f"ratio={current_segment['reverse_ratio']:.3f}"
                 )
+
+        def handle_axis(axis_name, raw_value, offset):
+            if current_segment is None:
+                return 0
+            invert_flag = current_segment["invert_x"] if axis_name == "x" else current_segment["invert_y"]
+            normalized = float(-raw_value if invert_flag else raw_value)
+            threshold = current_segment["deadzone"]
+            if normalized == 0.0:
+                return 0
+            if threshold > 0.0 and abs(normalized) < threshold:
+                current_segment[f"deadzone_skipped_{axis_name}"] += 1
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[DEADZONE] axis={axis_name.upper()} raw={raw_value} norm={normalized:.3f} thresh={threshold:.3f}"
+                    )
+                return 0
+
+            current_segment[f"raw_events_{axis_name}"] += 1
+
+            queue = current_segment[f"recent_{axis_name}"]
+            window = current_segment["reverse_window_sec"]
+            ratio = current_segment["reverse_ratio"]
+            while queue and (offset - queue[0][0]) > window:
+                queue.popleft()
+
+            direction = 0
+            monotonic = True
+            nonzero_prev = []
+            for _, value in queue:
+                if value == 0.0:
+                    continue
+                nonzero_prev.append(value)
+                sign = 1 if value > 0 else -1
+                if direction == 0:
+                    direction = sign
+                elif sign != direction:
+                    monotonic = False
+                    break
+
+            avg_step = sum(abs(v) for v in nonzero_prev) / len(nonzero_prev) if nonzero_prev else 0.0
+            suppressed = False
+            if monotonic and direction != 0:
+                sign_new = 1 if normalized > 0 else -1
+                if sign_new != direction and avg_step > 0.0 and abs(normalized) < ratio * avg_step:
+                    suppressed = True
+
+            if suppressed:
+                current_segment[f"reverse_suppressed_{axis_name}"] += 1
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[REV SUPPRESS] axis={axis_name.upper()} raw={raw_value} norm={normalized:.3f} "
+                        f"avg={avg_step:.3f} ratio={ratio:.3f}"
+                    )
+                return 0
+
+            queue.append((offset, normalized))
+            current_segment[f"abs_sum_processed_{axis_name}"] += abs(normalized)
+
+            acc_key = "acc_dx" if axis_name == "x" else "acc_dy"
+            gain = current_segment["gain_x"] if axis_name == "x" else current_segment["gain_y"]
+            current_segment[acc_key] += normalized * gain
+            step_value = int(round(current_segment[acc_key]))
+            if step_value != 0:
+                current_segment[acc_key] -= step_value
+            return step_value
 
         def process_relative_move(raw_dx, raw_dy, offset):
             nonlocal last_mouse_pos, current_segment
@@ -1332,10 +1556,6 @@ class MacroApp(QWidget):
                     )
                 return
 
-            seg_gain = current_segment['gain']
-            seg_invert_x = current_segment['invert_x']
-            seg_invert_y = current_segment['invert_y']
-
             current_segment['events'] += 1
             current_segment['rec_dx'] += raw_dx
             current_segment['rec_dy'] += raw_dy
@@ -1343,23 +1563,8 @@ class MacroApp(QWidget):
             if len(current_segment['first_moves']) < 10:
                 current_segment['first_moves'].append((raw_dx, raw_dy, offset))
 
-            adjusted_dx = raw_dx * seg_gain
-            adjusted_dy = raw_dy * seg_gain
-            if seg_invert_x:
-                adjusted_dx = -adjusted_dx
-            if seg_invert_y:
-                adjusted_dy = -adjusted_dy
-
-            current_segment['acc_dx'] += adjusted_dx
-            current_segment['acc_dy'] += adjusted_dy
-
-            send_dx = int(round(current_segment['acc_dx']))
-            send_dy = int(round(current_segment['acc_dy']))
-
-            if send_dx != 0:
-                current_segment['acc_dx'] -= send_dx
-            if send_dy != 0:
-                current_segment['acc_dy'] -= send_dy
+            send_dx = handle_axis('x', raw_dx, offset)
+            send_dy = handle_axis('y', raw_dy, offset)
 
             if send_dx != 0 or send_dy != 0:
                 if DEBUG_CAMERA_MOVEMENT:
@@ -1371,7 +1576,7 @@ class MacroApp(QWidget):
                 current_segment['sent_dx'] += send_dx
                 current_segment['sent_dy'] += send_dy
                 current_segment['sent_events'] += 1
-            elif DEBUG_CAMERA_MOVEMENT:
+            elif DEBUG_CAMERA_MOVEMENT and (raw_dx != 0 or raw_dy != 0):
                 self.signals.log_message.emit(
                     f"[REL ACC] raw Δ({raw_dx},{raw_dy}) накоплено; остаток=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
                 )
@@ -1408,15 +1613,66 @@ class MacroApp(QWidget):
                 duration = max(0.0, current_segment['last_offset'] - current_segment['start_offset'])
             event_rate = current_segment['events'] / duration if duration > 0 else current_segment['events']
 
+            suppress_ratio_x = (
+                current_segment['reverse_suppressed_x'] / max(1, current_segment['raw_events_x'])
+                if current_segment['raw_events_x'] else 0.0
+            )
+            suppress_ratio_y = (
+                current_segment['reverse_suppressed_y'] / max(1, current_segment['raw_events_y'])
+                if current_segment['raw_events_y'] else 0.0
+            )
+
             summary = (
                 f"[RMB SUMMARY] duration={duration:.3f}s moves={current_segment['events']} "
-                f"rate={event_rate:.1f}/s raw_sum=({current_segment['rec_dx']},{current_segment['rec_dy']}) "
-                f"sent_sum=({current_segment['sent_dx']},{current_segment['sent_dy']}) "
-                f"gain={current_segment['gain']:.3f} invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
+                f"rate={event_rate:.1f}/s raw_sum_dx={current_segment['rec_dx']} sent_dx={current_segment['sent_dx']} "
+                f"raw_sum_dy={current_segment['rec_dy']} sent_dy={current_segment['sent_dy']} "
+                f"gains(master={current_segment['gain_master']:.3f}, x={current_segment['gain_x']:.3f}, y={current_segment['gain_y']:.3f}) "
+                f"deadzone={current_segment['deadzone']:.3f} window={current_segment['reverse_window_sec'] * 1000:.1f}ms "
+                f"suppress_ratio=(X:{suppress_ratio_x:.3f}, Y:{suppress_ratio_y:.3f}) "
                 f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
                 f"leftover=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
             )
             self.signals.log_message.emit(summary)
+
+            avg_processed_x = (
+                current_segment['abs_sum_processed_x'] / max(1, current_segment['raw_events_x'])
+                if current_segment['raw_events_x'] else 0.0
+            )
+            avg_processed_y = (
+                current_segment['abs_sum_processed_y'] / max(1, current_segment['raw_events_y'])
+                if current_segment['raw_events_y'] else 0.0
+            )
+            self.signals.log_message.emit(
+                f"[RMB FILTER] raw_events=(X:{current_segment['raw_events_x']}, Y:{current_segment['raw_events_y']}) "
+                f"deadzone_skipped=(X:{current_segment['deadzone_skipped_x']}, Y:{current_segment['deadzone_skipped_y']}) "
+                f"reverse_suppressed=(X:{current_segment['reverse_suppressed_x']}, Y:{current_segment['reverse_suppressed_y']}) "
+                f"avg_step=(X:{avg_processed_x:.3f}, Y:{avg_processed_y:.3f})"
+            )
+
+            def _check_axis(label, rec_value, sent_value, invert_expected):
+                if rec_value == 0:
+                    return
+                if sent_value != 0:
+                    same_sign = (rec_value > 0) == (sent_value > 0)
+                    if invert_expected:
+                        if same_sign and abs(rec_value) > 0:
+                            self.signals.log_message.emit(
+                                f"[RMB WARNING] Ожидалась инверсия по оси {label}, но знаки совпадают."
+                            )
+                    else:
+                        if not same_sign:
+                            self.signals.log_message.emit(
+                                f"[RMB WARNING] Инверсия направления по оси {label}. Проверьте настройки инверсии."
+                            )
+                error = abs(sent_value - rec_value) / abs(rec_value)
+                if error > 0.05:
+                    self.signals.log_message.emit(
+                        f"[RMB WARNING] Отклонение по оси {label} {error * 100:.1f}% (rec={rec_value}, sent={sent_value}). "
+                        "Рекомендуется запустить автокалибровку."
+                    )
+
+            _check_axis('X', current_segment['rec_dx'], current_segment['sent_dx'], current_segment['invert_x'])
+            _check_axis('Y', current_segment['rec_dy'], current_segment['sent_dy'], current_segment['invert_y'])
 
             if DEBUG_CAMERA_MOVEMENT and current_segment['first_moves']:
                 preview = ", ".join(
@@ -1430,9 +1686,12 @@ class MacroApp(QWidget):
 
         if DEBUG_CAMERA_MOVEMENT:
             self.signals.log_message.emit(
-                f"[INIT DEBUG] Starting playback | gain={CAMERA_GAIN:.3f} "
+                f"[INIT DEBUG] Starting playback | gain_master={CAMERA_GAIN:.3f} "
+                f"gains(x={CAMERA_GAIN_X:.3f}, y={CAMERA_GAIN_Y:.3f}) "
                 f"invert=({int(INVERT_X_AXIS)},{int(INVERT_Y_AXIS)}) "
-                f"sender(max_step={SEND_RELATIVE_MAX_STEP}, delay={SEND_RELATIVE_DELAY * 1000:.3f}ms)"
+                f"sender(max_step={SEND_RELATIVE_MAX_STEP}, delay={SEND_RELATIVE_DELAY * 1000:.3f}ms) "
+                f"deadzone={DEADZONE_THRESHOLD:.3f} window={REVERSE_WINDOW_SECONDS * 1000:.1f}ms "
+                f"ratio={REVERSE_TINY_RATIO:.3f}"
             )
 
         for i in range(3, 0, -1):
