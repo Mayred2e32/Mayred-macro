@@ -26,8 +26,11 @@ def analyze_macro_file(filename):
 
         segments = []
         current_segment = None
+        all_relative_moves = []
 
         for idx, (event_type, event_args) in enumerate(events):
+            if event_type == 'mouse_move_relative':
+                all_relative_moves.append((idx, event_args))
             if event_type == 'mouse_press' and len(event_args) >= 4 and event_args[2] == 'Button.right':
                 current_segment = {
                     'press_idx': idx,
@@ -51,6 +54,10 @@ def analyze_macro_file(filename):
             print("\nПКМ-сегменты не найдены.")
         else:
             print(f"\nНайдено ПКМ-сегментов: {len(segments)}")
+            total_rel_dx = 0
+            total_rel_dy = 0
+            total_rel_count = 0
+            total_rel_duration = 0.0
             for seg_idx, segment in enumerate(segments, 1):
                 press_time = segment.get('press_time')
                 release_time = segment.get('release_time')
@@ -62,6 +69,12 @@ def analyze_macro_file(filename):
                 rel_sum_dy = sum(args[1] for _, args in rel_moves)
                 rel_length = math.hypot(rel_sum_dx, rel_sum_dy)
                 rel_rate = (len(rel_moves) / duration) if duration and duration > 0 else len(rel_moves)
+
+                total_rel_dx += rel_sum_dx
+                total_rel_dy += rel_sum_dy
+                total_rel_count += len(rel_moves)
+                if duration and duration > 0:
+                    total_rel_duration += duration
 
                 print(f"\n--- ПКМ сегмент #{seg_idx} ---")
                 print(f"  Индексы событий: press={segment['press_idx']} → release={segment.get('release_idx')}")
@@ -93,6 +106,41 @@ def analyze_macro_file(filename):
                     abs_dx = last_abs[0] - first_abs[0]
                     abs_dy = last_abs[1] - first_abs[1]
                     print(f"    Сумма абсолютных сдвигов: ({abs_dx}, {abs_dy})")
+
+            if total_rel_count:
+                total_rel_length = math.hypot(total_rel_dx, total_rel_dy)
+                avg_rate = total_rel_count / total_rel_duration if total_rel_duration > 0 else total_rel_count
+                print("\nСуммарно по всем ПКМ-сегментам:")
+                print(f"  Общая сумма Δ: ({total_rel_dx}, {total_rel_dy}), длина={total_rel_length:.2f} px")
+                print(
+                    f"  Всего относительных движений: {total_rel_count}, суммарная длительность={total_rel_duration:.4f} с, "
+                    f"средняя частота {avg_rate:.1f}/с"
+                )
+
+        if all_relative_moves:
+            print("\nПервые 10 относительных движений по всему макросу:")
+            for idx_move, (move_idx, move_args) in enumerate(all_relative_moves[:10], 1):
+                move_time = move_args[2]
+                print(f"  #{idx_move}: Δ({move_args[0]},{move_args[1]}) @ {move_time:.4f} с (event #{move_idx})")
+            all_sum_dx = sum(args[0] for _, args in all_relative_moves)
+            all_sum_dy = sum(args[1] for _, args in all_relative_moves)
+            all_length = math.hypot(all_sum_dx, all_sum_dy)
+            first_time = all_relative_moves[0][1][2]
+            last_time = all_relative_moves[-1][1][2]
+            span = max(0.0, last_time - first_time)
+            overall_rate = len(all_relative_moves) / span if span > 0 else len(all_relative_moves)
+            print(f"  Всего относительных событий: {len(all_relative_moves)}, span={span:.4f} с, средняя частота {overall_rate:.1f}/с")
+            print(f"  Сумма Δ по макросу: ({all_sum_dx}, {all_sum_dy}), длина={all_length:.2f} px")
+            if len(all_relative_moves) > 1:
+                rel_intervals = [
+                    all_relative_moves[i + 1][1][2] - all_relative_moves[i][1][2]
+                    for i in range(len(all_relative_moves) - 1)
+                ]
+                rel_intervals = [interval for interval in rel_intervals if interval >= 0]
+                if rel_intervals:
+                    print(
+                        f"  Интервалы Δ: min={min(rel_intervals):.4f} с, max={max(rel_intervals):.4f} с, avg={sum(rel_intervals)/len(rel_intervals):.4f} с"
+                    )
 
         if len(events) > 1:
             intervals = []
