@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, Signal, QObject, QSize
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
-    QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect
+    QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect
 )
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon
 
@@ -58,8 +58,10 @@ DEFAULT_SETTINGS = {
     "gain_y": 1.0,
     "invert_x": False,
     "invert_y": False,
+    "sender_mode": "auto",
     "sender_max_step": 1,
     "sender_delay_ms": 3.0,
+    "cursor_lock_enabled": False,
     "calibration_target_px": 400.0,
     "deadzone_threshold": 0.5,
     "reverse_window_ms": 40.0,
@@ -114,6 +116,12 @@ def sanitize_settings(raw):
     )
     data["invert_x"] = _to_bool(raw.get("invert_x", data["invert_x"]))
     data["invert_y"] = _to_bool(raw.get("invert_y", data["invert_y"]))
+
+    mode_value = str(raw.get("sender_mode", data.get("sender_mode", "auto"))).strip().lower()
+    if mode_value not in {"auto", "sendinput", "mouse_event"}:
+        mode_value = "auto"
+    data["sender_mode"] = mode_value
+
     data["sender_max_step"] = _clamp(
         _to_int(raw.get("sender_max_step", data["sender_max_step"]), data["sender_max_step"]),
         1,
@@ -124,6 +132,7 @@ def sanitize_settings(raw):
         2.0,
         3.0
     )
+    data["cursor_lock_enabled"] = _to_bool(raw.get("cursor_lock_enabled", data["cursor_lock_enabled"]))
     data["calibration_target_px"] = _clamp(
         _to_float(raw.get("calibration_target_px", data["calibration_target_px"]), data["calibration_target_px"]),
         50.0,
@@ -156,8 +165,10 @@ CAMERA_GAIN_X = CAMERA_GAIN * GAIN_X_MULTIPLIER
 CAMERA_GAIN_Y = CAMERA_GAIN * GAIN_Y_MULTIPLIER
 INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
 INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
+SENDER_MODE = CURRENT_SETTINGS["sender_mode"]
 SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
 SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
+CURSOR_LOCK_ENABLED = CURRENT_SETTINGS["cursor_lock_enabled"]
 CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
 DEADZONE_THRESHOLD = CURRENT_SETTINGS["deadzone_threshold"]
 REVERSE_WINDOW_MS = CURRENT_SETTINGS["reverse_window_ms"]
@@ -211,8 +222,8 @@ class SettingsManager:
 def apply_runtime_settings(settings_data):
     global CURRENT_SETTINGS, CAMERA_GAIN, GAIN_X_MULTIPLIER, GAIN_Y_MULTIPLIER
     global CAMERA_GAIN_X, CAMERA_GAIN_Y, INVERT_X_AXIS, INVERT_Y_AXIS
-    global SEND_RELATIVE_MAX_STEP, SEND_RELATIVE_DELAY, CALIBRATION_TARGET_PX
-    global DEADZONE_THRESHOLD, REVERSE_WINDOW_MS, REVERSE_WINDOW_SECONDS, REVERSE_TINY_RATIO
+    global SENDER_MODE, SEND_RELATIVE_MAX_STEP, SEND_RELATIVE_DELAY, CALIBRATION_TARGET_PX
+    global CURSOR_LOCK_ENABLED, DEADZONE_THRESHOLD, REVERSE_WINDOW_MS, REVERSE_WINDOW_SECONDS, REVERSE_TINY_RATIO
     CURRENT_SETTINGS = sanitize_settings(settings_data)
     CAMERA_GAIN = CURRENT_SETTINGS["camera_gain"]
     GAIN_X_MULTIPLIER = CURRENT_SETTINGS["gain_x"]
@@ -221,13 +232,20 @@ def apply_runtime_settings(settings_data):
     CAMERA_GAIN_Y = CAMERA_GAIN * GAIN_Y_MULTIPLIER
     INVERT_X_AXIS = CURRENT_SETTINGS["invert_x"]
     INVERT_Y_AXIS = CURRENT_SETTINGS["invert_y"]
+    SENDER_MODE = CURRENT_SETTINGS["sender_mode"]
     SEND_RELATIVE_MAX_STEP = CURRENT_SETTINGS["sender_max_step"]
     SEND_RELATIVE_DELAY = CURRENT_SETTINGS["sender_delay_ms"] / 1000.0
+    CURSOR_LOCK_ENABLED = CURRENT_SETTINGS["cursor_lock_enabled"]
     CALIBRATION_TARGET_PX = CURRENT_SETTINGS["calibration_target_px"]
     DEADZONE_THRESHOLD = CURRENT_SETTINGS["deadzone_threshold"]
     REVERSE_WINDOW_MS = CURRENT_SETTINGS["reverse_window_ms"]
     REVERSE_WINDOW_SECONDS = REVERSE_WINDOW_MS / 1000.0
     REVERSE_TINY_RATIO = CURRENT_SETTINGS["reverse_tiny_ratio"]
+
+    sender_instance = globals().get("RELATIVE_SENDER")
+    if sender_instance is not None and hasattr(sender_instance, "on_settings_changed"):
+        sender_instance.on_settings_changed()
+
     return CURRENT_SETTINGS
 
 # --- Низкоуровневый хелпер для относительного движения (Windows: SendInput) ---
@@ -261,73 +279,261 @@ if IS_WINDOWS:
         _fields_ = [("type", wintypes.DWORD), ("i", _I)]
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
     SendInput = user32.SendInput
     # Альтернатива: старый mouse_event API
     mouse_event = user32.mouse_event
-    
-    # Константы для mouse_event
+
+    ERROR_INVALID_PARAMETER = 87
     MOUSEEVENTF_MOVE_OLD = 0x0001
 
-    def _build_move_input(dx: int, dy: int) -> INPUT:
+    class POINT(ctypes.Structure):
+        _fields_ = [
+            ("x", wintypes.LONG),
+            ("y", wintypes.LONG),
+        ]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    def _build_move_input(dx: int, dy: int, flags: int) -> INPUT:
         inp = INPUT()
         inp.type = INPUT_MOUSE
         inp.mi.dx = int(dx)
         inp.mi.dy = int(dy)
         inp.mi.mouseData = 0
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE
+        inp.mi.dwFlags = flags
         inp.mi.time = 0
         inp.mi.dwExtraInfo = 0
         return inp
 
-    def send_relative_line(dx: int, dy: int):
-        """Отправляет относительное перемещение с учетом настроек разбиения и задержек."""
-        dx = int(dx); dy = int(dy)
-        if dx == 0 and dy == 0:
-            return
+    class RelativeMouseSender:
+        def __init__(self):
+            self._auto_sendinput_blocked = False
+            self._sendinput_nocoalesce_supported = None
+            self._last_mode_used = None
+            self._last_modes_sequence = tuple()
+            self._last_error = None
 
-        max_step = max(1, int(SEND_RELATIVE_MAX_STEP))
-        delay_seconds = max(0.0, float(SEND_RELATIVE_DELAY))
+        def _determine_mode(self):
+            mode = (SENDER_MODE or "auto").strip().lower()
+            if mode == "sendinput":
+                return "sendinput"
+            if mode == "mouse_event":
+                return "mouse_event"
+            if self._auto_sendinput_blocked:
+                return "mouse_event"
+            return "sendinput"
 
-        # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: каждый вызов функции
-        if DEBUG_CAMERA_MOVEMENT:
-            print(
-                f"[SEND_RELATIVE] Called with dx={dx}, dy={dy}, max_step={max_step}, "
-                f"delay={delay_seconds * 1000:.3f}ms"
-            )
+        def _probe_nocoalesce(self):
+            if self._sendinput_nocoalesce_supported is not None:
+                return self._sendinput_nocoalesce_supported
+            test_input = _build_move_input(0, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE)
+            kernel32.SetLastError(0)
+            result = SendInput(1, ctypes.byref(test_input), ctypes.sizeof(INPUT))
+            err = kernel32.GetLastError()
+            if result == 0 and err == ERROR_INVALID_PARAMETER:
+                self._sendinput_nocoalesce_supported = False
+            else:
+                self._sendinput_nocoalesce_supported = True
+            return self._sendinput_nocoalesce_supported
 
-        steps_x = math.ceil(abs(dx) / max_step) if max_step else 0
-        steps_y = math.ceil(abs(dy) / max_step) if max_step else 0
-        total_steps = max(steps_x, steps_y, 1)
+        def _send_via_sendinput(self, dx: int, dy: int) -> bool:
+            try:
+                flags = MOUSEEVENTF_MOVE
+                if self._probe_nocoalesce():
+                    flags |= MOUSEEVENTF_MOVE_NOCOALESCE
+                input_struct = _build_move_input(dx, dy, flags)
+                kernel32.SetLastError(0)
+                sent = SendInput(1, ctypes.byref(input_struct), ctypes.sizeof(INPUT))
+                if sent != 1:
+                    err = kernel32.GetLastError()
+                    self._last_error = ctypes.WinError(err)
+                    return False
+                self._last_error = None
+                return True
+            except Exception as exc:
+                self._last_error = exc
+                return False
 
-        step_dx = dx / total_steps
-        step_dy = dy / total_steps
+        def _send_via_mouse_event(self, dx: int, dy: int) -> bool:
+            try:
+                mouse_event(MOUSEEVENTF_MOVE_OLD, dx, dy, 0, 0)
+                self._last_error = None
+                return True
+            except Exception as exc:
+                self._last_error = exc
+                return False
 
-        prev_dx = 0
-        prev_dy = 0
+        def _send_step(self, mode: str, dx: int, dy: int):
+            if mode == "sendinput":
+                return self._send_via_sendinput(dx, dy), "sendinput"
+            return self._send_via_mouse_event(dx, dy), "mouse_event"
 
-        for i in range(1, total_steps + 1):
-            target_dx = int(round(step_dx * i))
-            target_dy = int(round(step_dy * i))
-            current_dx = target_dx - prev_dx
-            current_dy = target_dy - prev_dy
-            prev_dx = target_dx
-            prev_dy = target_dy
+        def send(self, dx: int, dy: int):
+            dx = int(dx)
+            dy = int(dy)
+            if dx == 0 and dy == 0:
+                return None
 
-            if current_dx != 0 or current_dy != 0:
-                # Используем mouse_event для лучшей совместимости с играми
-                mouse_event(MOUSEEVENTF_MOVE_OLD, current_dx, current_dy, 0, 0)
+            max_step = max(1, int(SEND_RELATIVE_MAX_STEP))
+            delay_seconds = max(0.0, float(SEND_RELATIVE_DELAY))
+
+            if DEBUG_CAMERA_MOVEMENT:
+                print(
+                    f"[SEND_RELATIVE] Requested dx={dx}, dy={dy}, max_step={max_step}, "
+                    f"delay={delay_seconds * 1000:.3f}ms, pref={SENDER_MODE}"
+                )
+
+            steps_x = math.ceil(abs(dx) / max_step) if max_step else 0
+            steps_y = math.ceil(abs(dy) / max_step) if max_step else 0
+            total_steps = max(steps_x, steps_y, 1)
+
+            step_dx = dx / total_steps
+            step_dy = dy / total_steps
+
+            prev_dx = 0
+            prev_dy = 0
+            last_mode = None
+            modes_sequence = []
+
+            for i in range(1, total_steps + 1):
+                target_dx = int(round(step_dx * i))
+                target_dy = int(round(step_dy * i))
+                current_dx = target_dx - prev_dx
+                current_dy = target_dy - prev_dy
+                prev_dx = target_dx
+                prev_dy = target_dy
+
+                if current_dx == 0 and current_dy == 0:
+                    continue
+
+                desired_mode = self._determine_mode()
+                success, mode_used = self._send_step(desired_mode, current_dx, current_dy)
+                if not success and desired_mode == "sendinput" and SENDER_MODE == "auto":
+                    self._auto_sendinput_blocked = True
+                    if DEBUG_CAMERA_MOVEMENT:
+                        print("[SENDER] SendInput failed in auto mode, fallback to mouse_event")
+                    success, mode_used = self._send_step("mouse_event", current_dx, current_dy)
+
+                if not success:
+                    if DEBUG_CAMERA_MOVEMENT:
+                        print(
+                            f"[SENDER ERROR] Failed to send ({current_dx},{current_dy}) via {desired_mode}: {self._last_error}"
+                        )
+                    break
+
+                last_mode = mode_used
+                if not modes_sequence or modes_sequence[-1] != mode_used:
+                    modes_sequence.append(mode_used)
 
                 if DEBUG_CAMERA_MOVEMENT:
-                    print(f"[SEND_RELATIVE] Step {i}/{total_steps}: ({current_dx},{current_dy})")
+                    print(f"[SEND_RELATIVE] Step {i}/{total_steps}: ({current_dx},{current_dy}) via {mode_used}")
 
-                # Регулируем задержку между шагами
                 if i < total_steps and delay_seconds > 0:
                     time.sleep(delay_seconds)
 
-        if DEBUG_CAMERA_MOVEMENT:
-            print(f"[SEND_RELATIVE] Completed: total delta=({dx},{dy}) in {total_steps} steps")
+            self._last_mode_used = last_mode
+            self._last_modes_sequence = tuple(modes_sequence)
+            return last_mode
 
-    kernel32 = ctypes.windll.kernel32
+        def on_settings_changed(self):
+            if SENDER_MODE != "auto":
+                self._auto_sendinput_blocked = False
+            else:
+                self._auto_sendinput_blocked = False
+
+        def get_last_mode(self):
+            return self._last_mode_used
+
+        def get_modes_sequence(self):
+            return self._last_modes_sequence
+
+        def get_last_error(self):
+            return self._last_error
+
+    RELATIVE_SENDER = RelativeMouseSender()
+
+    def send_relative_line(dx: int, dy: int):
+        """Отправляет относительное перемещение и возвращает фактический режим отправки."""
+        return RELATIVE_SENDER.send(dx, dy)
+
+    class CursorLocker:
+        def __init__(self, recenter_interval: float = 0.005):
+            self._recenter_interval = recenter_interval
+            self._last_recenter = 0.0
+            self._center = None
+            self._original = None
+            self._hwnd = None
+            self.active = False
+
+        def activate(self) -> bool:
+            try:
+                point = POINT()
+                if not user32.GetCursorPos(ctypes.byref(point)):
+                    return False
+                self._original = (point.x, point.y)
+                hwnd = user32.WindowFromPoint(point)
+                if not hwnd:
+                    return False
+                rect = RECT()
+                if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                    return False
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                if width <= 0 or height <= 0:
+                    return False
+                center_point = POINT(rect.left + width // 2, rect.top + height // 2)
+                if not user32.ClientToScreen(hwnd, ctypes.byref(center_point)):
+                    return False
+                self._center = (center_point.x, center_point.y)
+                self._hwnd = hwnd
+                if not user32.SetCursorPos(self._center[0], self._center[1]):
+                    return False
+                self._last_recenter = time.perf_counter()
+                self.active = True
+                if DEBUG_CAMERA_MOVEMENT:
+                    print(f"[CURSOR LOCK] Activated center={self._center}, original={self._original}")
+                return True
+            except Exception as exc:
+                if DEBUG_CAMERA_MOVEMENT:
+                    print(f"[CURSOR LOCK] Activation failed: {exc}")
+                self.active = False
+                return False
+
+        def maintain(self):
+            if not self.active or self._center is None:
+                return
+            now = time.perf_counter()
+            if now - self._last_recenter >= self._recenter_interval:
+                user32.SetCursorPos(self._center[0], self._center[1])
+                self._last_recenter = now
+
+        def release(self):
+            if not self.active:
+                return
+            if self._original is not None:
+                user32.SetCursorPos(self._original[0], self._original[1])
+                if DEBUG_CAMERA_MOVEMENT:
+                    print(f"[CURSOR LOCK] Restored cursor to {self._original}")
+            self.active = False
+
+        @property
+        def center(self):
+            return self._center
+
+        @property
+        def original(self):
+            return self._original
+
+        @property
+        def hwnd(self):
+            return self._hwnd
 
     WM_INPUT = 0x00FF
     RID_INPUT = 0x10000003
@@ -578,6 +784,7 @@ else:
 
         if DEBUG_CAMERA_MOVEMENT:
             print(f"[SEND_RELATIVE LINUX] Total events sent: {events_sent}, final delta=({dx},{dy})")
+        return "pynput"
 
 # Сигналы для безопасного обновления GUI из других потоков
 class WorkerSignals(QObject):
@@ -778,6 +985,17 @@ class MacroApp(QWidget):
         self.sender_delay_spinbox.valueChanged.connect(self.on_sender_delay_changed)
         camera_form.addRow("Delay (мс):", self.sender_delay_spinbox)
 
+        self.sender_mode_combobox = QComboBox()
+        self.sender_mode_combobox.addItem("Auto (SendInput -> mouse_event)", "auto")
+        self.sender_mode_combobox.addItem("SendInput", "sendinput")
+        self.sender_mode_combobox.addItem("mouse_event", "mouse_event")
+        self.sender_mode_combobox.currentIndexChanged.connect(self.on_sender_mode_changed)
+        camera_form.addRow("Sender:", self.sender_mode_combobox)
+
+        self.cursor_lock_checkbox = QCheckBox("Cursor-lock при RMB")
+        self.cursor_lock_checkbox.stateChanged.connect(self.on_cursor_lock_changed)
+        camera_form.addRow("Cursor lock:", self.cursor_lock_checkbox)
+
         self.calibration_target_spinbox = QDoubleSpinBox()
         self.calibration_target_spinbox.setRange(50.0, 2000.0)
         self.calibration_target_spinbox.setDecimals(1)
@@ -959,6 +1177,18 @@ class MacroApp(QWidget):
         self._set_spin_value(self.reverse_ratio_spinbox, float(data.get("reverse_tiny_ratio", REVERSE_TINY_RATIO)))
         self._set_spin_value(self.sender_step_spinbox, int(data.get("sender_max_step", SEND_RELATIVE_MAX_STEP)))
         self._set_spin_value(self.sender_delay_spinbox, float(data.get("sender_delay_ms", SEND_RELATIVE_DELAY * 1000.0)))
+
+        if hasattr(self, "sender_mode_combobox"):
+            mode_value = str(data.get("sender_mode", SENDER_MODE))
+            self.sender_mode_combobox.blockSignals(True)
+            index = self.sender_mode_combobox.findData(mode_value)
+            if index != -1:
+                self.sender_mode_combobox.setCurrentIndex(index)
+            self.sender_mode_combobox.blockSignals(False)
+
+        if hasattr(self, "cursor_lock_checkbox"):
+            self._set_checkbox_state(self.cursor_lock_checkbox, bool(data.get("cursor_lock_enabled", CURSOR_LOCK_ENABLED)))
+
         self._set_spin_value(self.calibration_target_spinbox, float(data.get("calibration_target_px", CALIBRATION_TARGET_PX)))
         self._update_calibration_ui_state()
 
@@ -1066,6 +1296,26 @@ class MacroApp(QWidget):
     def on_sender_delay_changed(self, value):
         self._update_setting("sender_delay_ms", float(value))
         self.log(f"Задержка между шагами = {SEND_RELATIVE_DELAY * 1000:.3f} мс")
+
+    def on_sender_mode_changed(self, index):
+        if not hasattr(self, "sender_mode_combobox"):
+            return
+        mode = self.sender_mode_combobox.itemData(index)
+        if mode is None:
+            return
+        self._update_setting("sender_mode", str(mode))
+        if IS_WINDOWS:
+            sender_instance = globals().get("RELATIVE_SENDER")
+            effective = sender_instance.get_last_mode() if sender_instance else None
+        else:
+            effective = "pynput"
+        self.log(f"Sender mode = {SENDER_MODE} (last={effective or 'n/a'})")
+
+    def on_cursor_lock_changed(self, state):
+        enabled = (state == Qt.Checked)
+        self._update_setting("cursor_lock_enabled", enabled)
+        status = "включен" if CURSOR_LOCK_ENABLED else "выключен"
+        self.log(f"Cursor-lock {status}")
 
     def on_calibration_target_changed(self, value):
         self._update_setting("calibration_target_px", float(value))
@@ -1456,6 +1706,9 @@ class MacroApp(QWidget):
                 "gain_y_multiplier": GAIN_Y_MULTIPLIER,
                 "invert_x": INVERT_X_AXIS,
                 "invert_y": INVERT_Y_AXIS,
+                "sender_preference": SENDER_MODE,
+                "sender_effective": None,
+                "sender_modes_used": [],
                 "sender_max_step": SEND_RELATIVE_MAX_STEP,
                 "sender_delay": SEND_RELATIVE_DELAY,
                 "deadzone": DEADZONE_THRESHOLD,
@@ -1471,15 +1724,55 @@ class MacroApp(QWidget):
                 "reverse_suppressed_y": 0,
                 "abs_sum_processed_x": 0.0,
                 "abs_sum_processed_y": 0.0,
+                "cursor_lock_requested": bool(IS_WINDOWS and CURSOR_LOCK_ENABLED),
+                "cursor_lock_active": False,
+                "cursor_lock_center": None,
+                "cursor_lock_original": None,
+                "cursor_lock_hwnd": None,
+                "cursor_locker": None,
+                "cursor_lock_restored": False,
+                "cursor_lock_failed": False,
+                "parity_corrections": [],
+                "parity_remaining": (0, 0),
+                "parity_attempted": False,
+                "parity_duration": 0.0,
+                "parity_deadline_exceeded": False,
             }
+            if IS_WINDOWS and current_segment["cursor_lock_requested"]:
+                locker = CursorLocker()
+                if locker.activate():
+                    current_segment["cursor_locker"] = locker
+                    current_segment["cursor_lock_active"] = True
+                    current_segment["cursor_lock_center"] = locker.center
+                    current_segment["cursor_lock_original"] = locker.original
+                    current_segment["cursor_lock_hwnd"] = locker.hwnd
+                    if DEBUG_CAMERA_MOVEMENT:
+                        hwnd_info = f"0x{int(locker.hwnd):X}" if locker.hwnd else "?"
+                        self.signals.log_message.emit(
+                            f"[CURSOR LOCK] Activated center={locker.center} original={locker.original} hwnd={hwnd_info}"
+                        )
+                else:
+                    current_segment["cursor_locker"] = locker
+                    current_segment["cursor_lock_failed"] = True
+                    if DEBUG_CAMERA_MOVEMENT:
+                        self.signals.log_message.emit("[CURSOR LOCK] Activation failed; continuing unlocked")
+
             if DEBUG_CAMERA_MOVEMENT:
+                sender_pref = current_segment["sender_preference"]
+                cursor_state = (
+                    "ON" if current_segment["cursor_lock_active"] else (
+                        "FAIL" if current_segment.get("cursor_lock_failed") else (
+                            "REQ" if current_segment["cursor_lock_requested"] else "OFF"
+                        )
+                    )
+                )
                 self.signals.log_message.emit(
                     f"[RMB SEGMENT] start offset={offset:.3f}s pos=({x},{y}) "
                     f"gains(master={current_segment['gain_master']:.3f}, x={current_segment['gain_x']:.3f}, y={current_segment['gain_y']:.3f}) "
                     f"invert=({int(current_segment['invert_x'])},{int(current_segment['invert_y'])}) "
-                    f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
+                    f"sender(pref={sender_pref}, max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
                     f"deadzone={current_segment['deadzone']:.3f} window={current_segment['reverse_window_sec'] * 1000:.1f}ms "
-                    f"ratio={current_segment['reverse_ratio']:.3f}"
+                    f"ratio={current_segment['reverse_ratio']:.3f} cursor_lock={cursor_state}"
                 )
 
         def handle_axis(axis_name, raw_value, offset):
@@ -1572,10 +1865,17 @@ class MacroApp(QWidget):
                         f"[REL SEND] raw Δ({raw_dx},{raw_dy}) -> sent ({send_dx},{send_dy}); "
                         f"остаток=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
                     )
-                send_relative_line(send_dx, send_dy)
+                mode_used = send_relative_line(send_dx, send_dy)
+                if mode_used:
+                    current_segment['sender_effective'] = mode_used
+                    if mode_used not in current_segment['sender_modes_used']:
+                        current_segment['sender_modes_used'].append(mode_used)
                 current_segment['sent_dx'] += send_dx
                 current_segment['sent_dy'] += send_dy
                 current_segment['sent_events'] += 1
+                locker = current_segment.get("cursor_locker")
+                if locker and locker.active:
+                    locker.maintain()
             elif DEBUG_CAMERA_MOVEMENT and (raw_dx != 0 or raw_dy != 0):
                 self.signals.log_message.emit(
                     f"[REL ACC] raw Δ({raw_dx},{raw_dy}) накоплено; остаток=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
@@ -1603,10 +1903,78 @@ class MacroApp(QWidget):
                     self.signals.log_message.emit(
                         f"[REL FLUSH] добавляем остаток ({flush_dx},{flush_dy}) перед отпусканием RMB"
                     )
-                send_relative_line(flush_dx, flush_dy)
+                mode_used = send_relative_line(flush_dx, flush_dy)
+                if mode_used:
+                    current_segment['sender_effective'] = mode_used
+                    if mode_used not in current_segment['sender_modes_used']:
+                        current_segment['sender_modes_used'].append(mode_used)
                 current_segment['sent_dx'] += flush_dx
                 current_segment['sent_dy'] += flush_dy
                 current_segment['sent_events'] += 1
+                locker = current_segment.get("cursor_locker")
+                if locker and locker.active:
+                    locker.maintain()
+
+            diff_dx = current_segment['rec_dx'] - current_segment['sent_dx']
+            diff_dy = current_segment['rec_dy'] - current_segment['sent_dy']
+            if diff_dx != 0 or diff_dy != 0:
+                parity_start = time.perf_counter()
+                deadline = parity_start + 0.02
+                while (diff_dx != 0 or diff_dy != 0) and time.perf_counter() <= deadline:
+                    step_dx = 0
+                    step_dy = 0
+                    if diff_dx != 0:
+                        step_dx = 1 if diff_dx > 0 else -1
+                        diff_dx -= step_dx
+                    if diff_dy != 0:
+                        step_dy = 1 if diff_dy > 0 else -1
+                        diff_dy -= step_dy
+                    if step_dx == 0 and step_dy == 0:
+                        break
+                    mode_used = send_relative_line(step_dx, step_dy)
+                    if mode_used:
+                        current_segment['sender_effective'] = mode_used
+                        if mode_used not in current_segment['sender_modes_used']:
+                            current_segment['sender_modes_used'].append(mode_used)
+                    current_segment['sent_dx'] += step_dx
+                    current_segment['sent_dy'] += step_dy
+                    current_segment['sent_events'] += 1
+                    current_segment['parity_corrections'].append((step_dx, step_dy))
+                    locker = current_segment.get("cursor_locker")
+                    if locker and locker.active:
+                        locker.maintain()
+                    if SEND_RELATIVE_DELAY > 0:
+                        remaining = deadline - time.perf_counter()
+                        if remaining > 0:
+                            time.sleep(min(SEND_RELATIVE_DELAY, remaining))
+                current_segment['parity_attempted'] = True
+                current_segment['parity_duration'] = time.perf_counter() - parity_start
+                remaining_dx = current_segment['rec_dx'] - current_segment['sent_dx']
+                remaining_dy = current_segment['rec_dy'] - current_segment['sent_dy']
+                current_segment['parity_remaining'] = (remaining_dx, remaining_dy)
+                current_segment['parity_deadline_exceeded'] = (remaining_dx != 0 or remaining_dy != 0)
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[PARITY] corrections={len(current_segment['parity_corrections'])} remaining=({remaining_dx},{remaining_dy}) "
+                        f"duration={current_segment['parity_duration'] * 1000:.1f}ms deadline_exceeded={current_segment['parity_deadline_exceeded']}"
+                    )
+
+            locker = current_segment.get("cursor_locker")
+            if locker and locker.active:
+                locker.release()
+                current_segment['cursor_lock_restored'] = True
+                if DEBUG_CAMERA_MOVEMENT:
+                    self.signals.log_message.emit(
+                        f"[CURSOR LOCK] Restored original position {locker.original}"
+                    )
+            elif locker and locker.original is not None and current_segment.get('cursor_lock_requested') and IS_WINDOWS:
+                # lock may have failed to activate; ensure original position restored if we have it
+                try:
+                    user32.SetCursorPos(locker.original[0], locker.original[1])
+                except Exception as exc:
+                    if DEBUG_CAMERA_MOVEMENT:
+                        self.signals.log_message.emit(f"[CURSOR LOCK] Failed to restore position: {exc}")
+                current_segment['cursor_lock_restored'] = True
 
             duration = 0.0
             if current_segment['start_offset'] is not None and current_segment['last_offset'] is not None:
@@ -1622,14 +1990,42 @@ class MacroApp(QWidget):
                 if current_segment['raw_events_y'] else 0.0
             )
 
+            sender_sequence = current_segment['sender_modes_used']
+            sender_info = "->".join(sender_sequence) if sender_sequence else current_segment['sender_preference']
+            last_mode = current_segment.get('sender_effective') or sender_info
+            cursor_state = (
+                "ON" if current_segment['cursor_lock_active'] else (
+                    "FAIL" if current_segment.get('cursor_lock_failed') else (
+                        "REQ" if current_segment['cursor_lock_requested'] else "OFF"
+                    )
+                )
+            )
+            cursor_restored = current_segment['cursor_lock_restored'] if current_segment['cursor_lock_requested'] else 'n/a'
+            parity_steps = len(current_segment['parity_corrections'])
+            parity_remaining = current_segment['parity_remaining']
+            parity_remaining_str = f"({parity_remaining[0]},{parity_remaining[1]})"
+            parity_duration_ms = current_segment['parity_duration'] * 1000.0 if current_segment['parity_attempted'] else 0.0
+            parity_deadline = current_segment['parity_deadline_exceeded']
+
+            def _axis_error(rec_value, sent_value):
+                if rec_value == 0:
+                    return 0.0 if sent_value == 0 else 100.0
+                return abs(sent_value - rec_value) / abs(rec_value) * 100.0
+
+            error_x_pct = _axis_error(current_segment['rec_dx'], current_segment['sent_dx'])
+            error_y_pct = _axis_error(current_segment['rec_dy'], current_segment['sent_dy'])
+
             summary = (
-                f"[RMB SUMMARY] duration={duration:.3f}s moves={current_segment['events']} "
-                f"rate={event_rate:.1f}/s raw_sum_dx={current_segment['rec_dx']} sent_dx={current_segment['sent_dx']} "
-                f"raw_sum_dy={current_segment['rec_dy']} sent_dy={current_segment['sent_dy']} "
+                f"[RMB SUMMARY] duration={duration:.3f}s moves={current_segment['events']} rate={event_rate:.1f}/s "
+                f"rec_dx={current_segment['rec_dx']} sent_dx={current_segment['sent_dx']} err_x={error_x_pct:.2f}% "
+                f"rec_dy={current_segment['rec_dy']} sent_dy={current_segment['sent_dy']} err_y={error_y_pct:.2f}% "
+                f"sender_seq={sender_info} sender_last={last_mode} cursor_lock={cursor_state} restored={cursor_restored} "
+                f"parity_steps={parity_steps} parity_remaining={parity_remaining_str} parity_ms={parity_duration_ms:.1f} "
+                f"parity_deadline_exceeded={parity_deadline} "
                 f"gains(master={current_segment['gain_master']:.3f}, x={current_segment['gain_x']:.3f}, y={current_segment['gain_y']:.3f}) "
                 f"deadzone={current_segment['deadzone']:.3f} window={current_segment['reverse_window_sec'] * 1000:.1f}ms "
                 f"suppress_ratio=(X:{suppress_ratio_x:.3f}, Y:{suppress_ratio_y:.3f}) "
-                f"sender(max_step={current_segment['sender_max_step']}, delay={current_segment['sender_delay'] * 1000:.3f}ms) "
+                f"sender_step={current_segment['sender_max_step']} delay={current_segment['sender_delay'] * 1000:.3f}ms "
                 f"leftover=({current_segment['acc_dx']:.3f},{current_segment['acc_dy']:.3f})"
             )
             self.signals.log_message.emit(summary)
@@ -1784,13 +2180,24 @@ class MacroApp(QWidget):
                                 f"[RELEASE DEBUG] button={button_str} pos({x},{y}) pressed_before={pressed_buttons}"
                             )
 
-                        mouse_controller.position = (x, y)
+                        lock_active = (
+                            button == mouse.Button.right
+                            and current_segment is not None
+                            and current_segment.get("cursor_lock_active")
+                        )
+                        if not lock_active:
+                            mouse_controller.position = (x, y)
+                        elif DEBUG_CAMERA_MOVEMENT:
+                            self.signals.log_message.emit(
+                                f"[CURSOR LOCK] Skip absolute reposition on release due to cursor lock"
+                            )
+
                         if button:
                             if button == mouse.Button.right and in_rmb_segment:
                                 finish_rmb_segment(event_args[3])
                             mouse_controller.release(button)
                             pressed_buttons.discard(button)
-                            if button == mouse.Button.right:
+                            if button == mouse.Button.right and not lock_active:
                                 last_mouse_pos = (x, y)
 
                     elif event_type == 'mouse_scroll':
