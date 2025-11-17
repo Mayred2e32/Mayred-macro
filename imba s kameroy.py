@@ -1,26 +1,32 @@
+from __future__ import annotations
+
 import sys
-import time
-import threading
-import queue
 import json
-import os
 import math
-import statistics
+import os
 import platform
-from pathlib import Path
+import queue
+import statistics
+import threading
+import time
 from collections import deque
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # --- Импорты для GUI (PySide6) ---
 from PySide6.QtCore import Qt, Signal, QObject, QSize
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
-    QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect
+    QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect,
+    QFileDialog, QTabWidget,
 )
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon
 
 # --- Импорты для записи и воспроизведения (pynput) ---
 from pynput import mouse, keyboard
+
+from macro_diagnostics import MacroAnalyzer, MacroDiagnosis
 
 # --- Конфигурация и словари для безопасного сопоставления клавиш ---
 MACROS_DIR = Path(__file__).parent / "macros"
@@ -47,6 +53,8 @@ SPECIAL_KEYS = {
 MOUSE_BUTTONS = {
     'Button.left': mouse.Button.left, 'Button.right': mouse.Button.right, 'Button.middle': mouse.Button.middle,
 }
+
+MACRO_FORMAT_VERSION = 2
 
 # --- Настройки симуляции камеры и конфиг приложения ---
 MIN_STEP_THRESHOLD = 0    # Минимальный модуль дельты, чтобы отправлять движение
@@ -949,13 +957,19 @@ class WorkerSignals(QObject):
 class MacroApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.recorded_events = []
+        self.recorded_events: List[Tuple[str, Sequence[Any]]] = []
+        self.recording_metadata: Dict[str, Any] = {}
         self.is_recording = False
         self.is_playing = False
         self._calibration_in_progress = False
         self.settings_manager = SettingsManager()
         apply_runtime_settings(self.settings_manager.as_dict())
         self.signals = WorkerSignals()
+        self.macro_analyzer = MacroAnalyzer()
+        self.diagnostics_macro_combo: Optional[QComboBox] = None
+        self.diagnostics_output: Optional[QTextEdit] = None
+        self.diagnostics_status_label: Optional[QLabel] = None
+        self._diagnostics_last_external_path: Optional[str] = None
         os.makedirs(MACROS_DIR, exist_ok=True)
         self._build_ui()
         self._apply_styles()  # Применяем дизайн
@@ -975,13 +989,22 @@ class MacroApp(QWidget):
         self.setWindowTitle("Ayred Macro")
         if os.path.exists("logo.png"):
             self.setWindowIcon(QIcon("logo.png"))
-        self.setMinimumSize(850, 650)
+        self.setMinimumSize(900, 680)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 10, 20, 20)
         main_layout.setSpacing(15)
 
-        # --- Заголовок с логотипом ---
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        main_layout.addWidget(self.tabs)
+
+        # --- Главная вкладка ---
+        main_tab = QWidget()
+        main_tab_layout = QVBoxLayout(main_tab)
+        main_tab_layout.setContentsMargins(0, 0, 0, 0)
+        main_tab_layout.setSpacing(15)
+
         header_layout = QHBoxLayout()
         logo_label = QLabel()
         if os.path.exists("logo.png"):
@@ -992,11 +1015,11 @@ class MacroApp(QWidget):
         header_layout.addWidget(logo_label)
         header_layout.addWidget(title_label)
         header_layout.addStretch()
-        main_layout.addLayout(header_layout)
+        main_tab_layout.addLayout(header_layout)
 
-        # --- Панель управления ---
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(10)
+
         self.record_button = QPushButton("старт(aladayngay❤️)")
         self.record_button.setObjectName("recordButton")
         self.record_button.setMinimumHeight(45)
@@ -1022,13 +1045,11 @@ class MacroApp(QWidget):
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.stop_playback_button)
         controls_layout.addWidget(self.consistency_test_button)
-        main_layout.addLayout(controls_layout)
+        main_tab_layout.addLayout(controls_layout)
 
-        # --- Основная рабочая область ---
         workspace_layout = QHBoxLayout()
         workspace_layout.setSpacing(15)
 
-        # Левая колонка: Макросы
         left_panel = QFrame()
         left_panel.setObjectName("panel")
         left_panel_layout = QVBoxLayout(left_panel)
@@ -1050,11 +1071,9 @@ class MacroApp(QWidget):
 
         workspace_layout.addWidget(left_panel, stretch=3)
 
-        # Правая колонка: Настройки и Лог
         right_column = QVBoxLayout()
         right_column.setSpacing(15)
 
-        # Настройки
         settings_panel = QFrame()
         settings_panel.setObjectName("panel")
         settings_panel_layout = QVBoxLayout(settings_panel)
@@ -1175,6 +1194,32 @@ class MacroApp(QWidget):
 
         settings_panel_layout.addLayout(camera_form)
 
+        settings_panel_layout.addWidget(QLabel("Контекст записи:"))
+        recording_form = QFormLayout()
+        recording_form.setSpacing(10)
+        self.shiftlock_record_checkbox = QCheckBox("ShiftLock активен")
+        self.shiftlock_record_checkbox.stateChanged.connect(self.on_shiftlock_record_changed)
+        recording_form.addRow("ShiftLock:", self.shiftlock_record_checkbox)
+
+        self.record_fps_spinbox = QDoubleSpinBox()
+        self.record_fps_spinbox.setRange(15.0, 360.0)
+        self.record_fps_spinbox.setDecimals(1)
+        self.record_fps_spinbox.setSingleStep(1.0)
+        self.record_fps_spinbox.setValue(60.0)
+        self.record_fps_spinbox.valueChanged.connect(self.on_record_fps_changed)
+        recording_form.addRow("FPS записи:", self.record_fps_spinbox)
+        settings_panel_layout.addLayout(recording_form)
+
+        config_buttons_layout = QHBoxLayout()
+        config_buttons_layout.setSpacing(8)
+        self.export_config_button = QPushButton("Экспорт настроек")
+        self.export_config_button.clicked.connect(self.export_settings)
+        self.import_config_button = QPushButton("Импорт настроек")
+        self.import_config_button.clicked.connect(self.import_settings)
+        config_buttons_layout.addWidget(self.export_config_button)
+        config_buttons_layout.addWidget(self.import_config_button)
+        settings_panel_layout.addLayout(config_buttons_layout)
+
         self.environment_label = QLabel()
         self.environment_label.setWordWrap(True)
         self.environment_label.setText("Проверка системных параметров...")
@@ -1182,7 +1227,6 @@ class MacroApp(QWidget):
 
         right_column.addWidget(settings_panel)
 
-        # Лог
         log_panel = QFrame()
         log_panel.setObjectName("panel")
         log_panel_layout = QVBoxLayout(log_panel)
@@ -1194,7 +1238,42 @@ class MacroApp(QWidget):
         right_column.addWidget(log_panel, stretch=1)
 
         workspace_layout.addLayout(right_column, stretch=4)
-        main_layout.addLayout(workspace_layout)
+        main_tab_layout.addLayout(workspace_layout)
+
+        self.tabs.addTab(main_tab, "Главная")
+
+        # --- Вкладка диагностики ---
+        diagnostics_tab = QWidget()
+        diagnostics_layout = QVBoxLayout(diagnostics_tab)
+        diagnostics_layout.setContentsMargins(15, 15, 15, 15)
+        diagnostics_layout.setSpacing(12)
+
+        diag_title = QLabel("Diagnostics")
+        diag_title.setObjectName("diagTitle")
+        diagnostics_layout.addWidget(diag_title)
+
+        diag_controls = QHBoxLayout()
+        diag_controls.setSpacing(10)
+        diag_controls.addWidget(QLabel("Макрос:"))
+        self.diagnostics_macro_combo = QComboBox()
+        diag_controls.addWidget(self.diagnostics_macro_combo, 1)
+        self.diagnostics_analyze_button = QPushButton("Анализировать выбранный")
+        self.diagnostics_analyze_button.clicked.connect(self.run_selected_macro_diagnostics)
+        diag_controls.addWidget(self.diagnostics_analyze_button)
+        self.diagnostics_open_button = QPushButton("Открыть файл…")
+        self.diagnostics_open_button.clicked.connect(self.open_external_macro_for_diagnostics)
+        diag_controls.addWidget(self.diagnostics_open_button)
+        diagnostics_layout.addLayout(diag_controls)
+
+        self.diagnostics_status_label = QLabel("Выберите макрос для анализа.")
+        self.diagnostics_status_label.setWordWrap(True)
+        diagnostics_layout.addWidget(self.diagnostics_status_label)
+
+        self.diagnostics_output = QTextEdit()
+        self.diagnostics_output.setReadOnly(True)
+        diagnostics_layout.addWidget(self.diagnostics_output, 1)
+
+        self.tabs.addTab(diagnostics_tab, "Diagnostics")
 
     def _apply_styles(self):
         """Применяет весь QSS-стиль к приложению."""
@@ -1223,6 +1302,26 @@ class MacroApp(QWidget):
             }}
             MacroApp {{
                 background: {BG_GRADIENT};
+            }}
+            QTabWidget::pane {{
+                border: none;
+            }}
+            QTabBar::tab {{
+                background-color: {PANEL_BG};
+                border: 1px solid #EAECEE;
+                padding: 6px 12px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background: {PRIMARY_GRADIENT};
+                color: white;
+            }}
+            QLabel#diagTitle {{
+                font-size: 14pt;
+                font-weight: bold;
+                color: #2E4053;
             }}
             QFrame#panel {{
                 background-color: {PANEL_BG};
@@ -1408,6 +1507,35 @@ class MacroApp(QWidget):
             messages.append("Среда: не Windows. Автокалибровка использует координаты курсора.")
         self.environment_label.setText("\n".join(messages))
 
+    def export_settings(self):
+        default_path = str(SETTINGS_FILE.with_name("settings_export.json"))
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт настроек", default_path, "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump(self.settings_manager.as_dict(), file, indent=4, ensure_ascii=False)
+            self.log(f"Настройки экспортированы в {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Экспорт настроек", f"Не удалось сохранить файл: {exc}")
+
+    def import_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Импорт настроек", str(SETTINGS_FILE.parent), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, dict):
+                raise ValueError("Файл не содержит словарь с настройками")
+            sanitized = sanitize_settings(loaded)
+            self.settings_manager.data = sanitized
+            self.settings_manager.save()
+            self._on_settings_updated(sanitized)
+            self.log(f"Настройки импортированы из {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Импорт настроек", f"Не удалось загрузить файл: {exc}")
+
     def log(self, message):
         timestamp = time.strftime("%H:%M:%S")
         self.log_edit.append(f"[{timestamp}] {message}")
@@ -1484,6 +1612,16 @@ class MacroApp(QWidget):
         self._update_setting("cursor_lock_enabled", enabled)
         status = "включен" if CURSOR_LOCK_ENABLED else "выключен"
         self.log(f"Cursor-lock {status}")
+
+    def on_shiftlock_record_changed(self, state):
+        enabled = (state == Qt.Checked)
+        self.recording_metadata["shiftlock"] = enabled
+        self.log("ShiftLock для записи " + ("включен" if enabled else "выключен"))
+
+    def on_record_fps_changed(self, value):
+        fps = float(value)
+        self.recording_metadata["recorded_fps"] = fps
+        self.log(f"Ожидаемый FPS записи = {fps:.1f}")
 
     def on_calibration_target_changed(self, value):
         self._update_setting("calibration_target_px", float(value))
@@ -1648,22 +1786,304 @@ class MacroApp(QWidget):
 
             self.signals.calibration_finished.emit()
 
+    def _get_active_window_info(self) -> Optional[Dict[str, Any]]:
+        if not IS_WINDOWS:
+            return None
+        try:
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            length = user32.GetWindowTextLengthW(hwnd)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            title = buffer.value
+            rect = RECT()
+            bounds = None
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                bounds = {
+                    "left": rect.left,
+                    "top": rect.top,
+                    "right": rect.right,
+                    "bottom": rect.bottom,
+                }
+            pid = wintypes.DWORD()
+            thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            process_name = None
+            try:
+                import psutil  # type: ignore
+                process_name = psutil.Process(pid.value).name()
+            except Exception:
+                process_name = None
+            return {
+                "title": title,
+                "hwnd": int(hwnd),
+                "bounds": bounds,
+                "pid": pid.value,
+                "thread_id": thread_id,
+                "process": process_name,
+            }
+        except Exception:
+            return None
+
+    def _get_dpi_scale(self) -> Optional[float]:
+        if not IS_WINDOWS:
+            return None
+        try:
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            if dpi:
+                return round(dpi / 96.0, 4)
+        except Exception:
+            return None
+        return None
+
+    def _get_pointer_precision_state(self) -> Optional[bool]:
+        if not IS_WINDOWS:
+            return None
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\\Mouse") as key:
+                mouse_speed, _ = winreg.QueryValueEx(key, "MouseSpeed")
+            return str(mouse_speed) != "0"
+        except Exception:
+            return None
+
+    def _collect_system_context(self) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "platform": platform.system(),
+            "platform_release": platform.release(),
+        }
+        if IS_WINDOWS:
+            context["active_window"] = self._get_active_window_info()
+            context["dpi_scale"] = self._get_dpi_scale()
+            context["pointer_precision_enabled"] = self._get_pointer_precision_state()
+        return {"system": context}
+
+    def _gather_recording_metadata(self) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "format_version": MACRO_FORMAT_VERSION,
+            "recorded_at": time.time(),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "settings_snapshot": self.settings_manager.as_dict(),
+        }
+        shiftlock = False
+        if hasattr(self, "shiftlock_record_checkbox") and self.shiftlock_record_checkbox is not None:
+            shiftlock = bool(self.shiftlock_record_checkbox.isChecked())
+        metadata["shiftlock"] = shiftlock
+        if hasattr(self, "record_fps_spinbox") and self.record_fps_spinbox is not None:
+            metadata["recorded_fps"] = float(self.record_fps_spinbox.value())
+        metadata.update(self._collect_system_context())
+        return metadata
+
+    def _normalize_macro_events(self, events: Iterable[Any]) -> Tuple[List[Tuple[str, Sequence[Any]]], List[str]]:
+        normalized: List[Tuple[str, Sequence[Any]]] = []
+        notes: List[str] = []
+        rmb_pressed = False
+        last_abs_pos: Optional[Tuple[int, int]] = None
+        converted_absolute = 0
+        sanitized_relative = 0
+        skipped = 0
+
+        def extract_offset(args: Sequence[Any]) -> float:
+            for value in reversed(args):
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return 0.0
+
+        def to_int(value: Any) -> int:
+            try:
+                return int(round(float(value)))
+            except Exception:
+                try:
+                    return int(value)
+                except Exception:
+                    return 0
+
+        for raw_entry in events:
+            if not isinstance(raw_entry, (list, tuple)) or len(raw_entry) < 2:
+                skipped += 1
+                continue
+            event_type = str(raw_entry[0])
+            raw_args = raw_entry[1]
+            if isinstance(raw_args, (list, tuple)):
+                args = list(raw_args)
+            else:
+                args = [raw_args]
+
+            offset = extract_offset(args)
+
+            if event_type == "mouse_pos":
+                if len(args) < 2:
+                    skipped += 1
+                    continue
+                x = to_int(args[0])
+                y = to_int(args[1])
+                normalized.append(("mouse_pos", (x, y, offset)))
+                last_abs_pos = (x, y)
+                continue
+
+            if event_type == "mouse_move":
+                if len(args) < 2:
+                    skipped += 1
+                    continue
+                x = to_int(args[0])
+                y = to_int(args[1])
+                if rmb_pressed:
+                    if last_abs_pos is None:
+                        last_abs_pos = (x, y)
+                    dx = x - last_abs_pos[0]
+                    dy = y - last_abs_pos[1]
+                    last_abs_pos = (x, y)
+                    if dx != 0 or dy != 0:
+                        normalized.append(("mouse_move_relative", (dx, dy, offset)))
+                        converted_absolute += 1
+                else:
+                    normalized.append(("mouse_move", (x, y, offset)))
+                    last_abs_pos = (x, y)
+                continue
+
+            if event_type == "mouse_move_relative":
+                if len(args) < 2:
+                    skipped += 1
+                    continue
+                dx = to_int(args[0])
+                dy = to_int(args[1])
+                normalized.append(("mouse_move_relative", (dx, dy, offset)))
+                sanitized_relative += 1
+                if rmb_pressed and last_abs_pos is not None:
+                    last_abs_pos = (last_abs_pos[0] + dx, last_abs_pos[1] + dy)
+                continue
+
+            if event_type == "mouse_press":
+                x = to_int(args[0]) if len(args) >= 1 else 0
+                y = to_int(args[1]) if len(args) >= 2 else 0
+                button_str = str(args[2]) if len(args) >= 3 else "Button.left"
+                normalized.append(("mouse_press", (x, y, button_str, offset)))
+                if button_str == "Button.right":
+                    rmb_pressed = True
+                    last_abs_pos = (x, y)
+                continue
+
+            if event_type == "mouse_release":
+                x = to_int(args[0]) if len(args) >= 1 else 0
+                y = to_int(args[1]) if len(args) >= 2 else 0
+                button_str = str(args[2]) if len(args) >= 3 else "Button.left"
+                normalized.append(("mouse_release", (x, y, button_str, offset)))
+                if button_str == "Button.right":
+                    rmb_pressed = False
+                    last_abs_pos = (x, y)
+                continue
+
+            if event_type == "mouse_scroll":
+                dx = to_int(args[0]) if len(args) >= 1 else 0
+                dy = to_int(args[1]) if len(args) >= 2 else 0
+                normalized.append(("mouse_scroll", (dx, dy, offset)))
+                continue
+
+            if event_type in {"key_press", "key_release"}:
+                key_value = str(args[0]) if args else ""
+                normalized.append((event_type, (key_value, offset)))
+                continue
+
+            normalized.append((event_type, tuple(args)))
+
+        if converted_absolute:
+            notes.append(f"Конвертировано абсолютных перемещений внутри RMB сегментов: {converted_absolute}")
+        if sanitized_relative:
+            notes.append(f"Нормализовано относительных перемещений: {sanitized_relative}")
+        if skipped:
+            notes.append(f"Пропущено некорректных событий: {skipped}")
+        if rmb_pressed:
+            notes.append("Запись завершилась без события отпускания ПКМ. Проверьте макрос.")
+        return normalized, notes
+
+    def _load_macro_file(self, filepath: Path) -> Tuple[List[Tuple[str, Sequence[Any]]], Dict[str, Any], List[str]]:
+        with open(filepath, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        metadata: Dict[str, Any] = {}
+        notes: List[str] = []
+        if isinstance(payload, dict):
+            metadata = payload.get("metadata") or {}
+            events_raw = payload.get("events") or []
+            version = payload.get("version") or payload.get("format_version") or MACRO_FORMAT_VERSION
+            if version and version < MACRO_FORMAT_VERSION:
+                notes.append(f"Старый формат макроса обнаружен ({version}). Конвертация выполнена автоматически.")
+            metadata.setdefault("format_version", version)
+        elif isinstance(payload, list):
+            events_raw = payload
+            notes.append("Старый формат макроса (список событий) конвертирован автоматически.")
+        else:
+            raise ValueError("Неизвестный формат файла макроса.")
+        normalized, normalization_notes = self._normalize_macro_events(events_raw)
+        notes.extend(normalization_notes)
+        metadata.setdefault("format_version", MACRO_FORMAT_VERSION)
+        return normalized, metadata, notes
+
+    def _format_metadata_for_log(self, metadata: Dict[str, Any]) -> List[str]:
+        lines = ["[MACRO META] Метаданные записи:"]
+        format_version = metadata.get("format_version")
+        if format_version is not None:
+            lines.append(f"[MACRO META] Формат: {format_version}")
+        recorded_at = metadata.get("recorded_at")
+        if isinstance(recorded_at, (int, float)):
+            try:
+                recorded_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded_at))
+                lines.append(f"[MACRO META] Записан: {recorded_ts}")
+            except Exception:
+                pass
+        shiftlock = metadata.get("shiftlock")
+        if shiftlock is not None:
+            lines.append("[MACRO META] ShiftLock: " + ("включен" if shiftlock else "выключен"))
+        fps_value = metadata.get("recorded_fps")
+        if isinstance(fps_value, (int, float)) and fps_value > 0:
+            lines.append(f"[MACRO META] FPS: {fps_value:.1f}")
+        system_info = metadata.get("system")
+        if isinstance(system_info, dict):
+            platform_name = system_info.get("platform")
+            if platform_name:
+                lines.append(f"[MACRO META] Платформа: {platform_name}")
+            dpi_scale = system_info.get("dpi_scale")
+            if isinstance(dpi_scale, (int, float)):
+                lines.append(f"[MACRO META] DPI scale: {dpi_scale}")
+            pointer_precision = system_info.get("pointer_precision_enabled")
+            if pointer_precision is not None:
+                lines.append("[MACRO META] Pointer precision: " + ("включена" if pointer_precision else "выключена"))
+            active_window = system_info.get("active_window")
+            if isinstance(active_window, dict):
+                title = active_window.get("title") or "?"
+                process = active_window.get("process") or "?"
+                lines.append(f"[MACRO META] Активное окно: {title} ({process})")
+        return lines
+
     def toggle_recording(self):
         if self.is_recording:
             self.is_recording = False
+            self.recording_metadata.setdefault("stopped_at", time.time())
             self.log("Остановка записи...")
         else:
+            self.recording_metadata = self._gather_recording_metadata()
+            self.recording_metadata.update({
+                "raw_input_available": False,
+                "relative_events": 0,
+                "absolute_events": 0,
+            })
             self.is_recording = True
             threading.Thread(target=self.record_worker, daemon=True).start()
             self.update_ui_for_recording(True)
-            self.log("Запись началась! Выполняйте действия...")
+            shiftlock_state = "включен" if self.recording_metadata.get("shiftlock") else "выключен"
+            self.log(f"Запись началась! ShiftLock {shiftlock_state}. Выполняйте действия...")
 
     def record_worker(self):
         self.recorded_events = []
+        metadata = self.recording_metadata
+        metadata.setdefault("raw_input_available", False)
+        metadata.setdefault("raw_relative_events", 0)
+        metadata["recording_started_at"] = metadata.get("recording_started_at", time.time())
         start_time = time.perf_counter()
         def get_offset(): return time.perf_counter() - start_time
         mouse_controller = mouse.Controller()
         initial_pos = (mouse_controller.position[0], mouse_controller.position[1])
+        metadata["initial_cursor"] = {"x": int(initial_pos[0]), "y": int(initial_pos[1])}
         self.recorded_events.append(('mouse_pos', (initial_pos[0], initial_pos[1], 0.0)))
         
         # Отслеживание состояния и дебаг
@@ -1679,6 +2099,7 @@ class MacroApp(QWidget):
                 raw_listener = RawMouseDeltaListener()
                 raw_listener.start()
                 raw_listener_ready = raw_listener.wait_until_ready()
+                metadata["raw_input_available"] = bool(raw_listener_ready)
                 if DEBUG_CAMERA_MOVEMENT:
                     status = "готов" if raw_listener_ready else "не запущен"
                     self.signals.log_message.emit(f"[RAW INIT] Raw input listener {status}")
@@ -1689,6 +2110,7 @@ class MacroApp(QWidget):
             except Exception as e:
                 raw_listener = None
                 raw_listener_ready = False
+                metadata["raw_input_available"] = False
                 if DEBUG_CAMERA_MOVEMENT:
                     self.signals.log_message.emit(f"[RAW INIT ERROR] {e}")
 
@@ -1708,6 +2130,7 @@ class MacroApp(QWidget):
                 dx_i = int(dx)
                 dy_i = int(dy)
                 if mouse.Button.right in pressed_buttons:
+                    metadata["raw_relative_events"] = metadata.get("raw_relative_events", 0) + 1
                     self.recorded_events.append(('mouse_move_relative', (dx_i, dy_i, offset)))
                     if DEBUG_CAMERA_MOVEMENT and (raw_move_count % 5 == 0 or raw_move_count <= 2):
                         self.signals.log_message.emit(
@@ -1821,13 +2244,19 @@ class MacroApp(QWidget):
         if IS_WINDOWS and raw_listener:
             drain_raw_events()
             raw_listener.stop()
+        metadata["raw_input_used"] = bool(raw_listener_ready)
+        metadata["recording_duration"] = time.perf_counter() - start_time
+        metadata["event_count"] = len(self.recorded_events)
+        metadata["relative_events"] = sum(1 for evt, _ in self.recorded_events if evt == 'mouse_move_relative')
+        metadata["absolute_events"] = sum(1 for evt, _ in self.recorded_events if evt == 'mouse_move')
+        metadata["raw_relative_events"] = raw_move_count
         self.signals.recording_stopped.emit()
 
-    def _start_playback(self, events, loops, name, consistency_runs=None):
+    def _start_playback(self, events, loops, name, consistency_runs=None, metadata=None):
         self.is_playing = True
         threading.Thread(
             target=self.play_worker,
-            args=(events, loops, name, consistency_runs),
+            args=(events, loops, name, consistency_runs, metadata),
             daemon=True,
         ).start()
 
@@ -1840,12 +2269,13 @@ class MacroApp(QWidget):
         name = current_item.text()
         filepath = MACROS_DIR / f"{name}.json"
         try:
-            with open(filepath, 'r') as f:
-                events = json.load(f)
+            events, metadata, notes = self._load_macro_file(filepath)
+            for note in notes:
+                self.log(f"[MACRO] {note}")
             loops = 0 if self.infinite_checkbox.isChecked() else self.loops_spinbox.value()
-            self._start_playback(events, loops, name)
-        except Exception as e:
-            self.log(f"Ошибка при загрузке макроса: {e}")
+            self._start_playback(events, loops, name, metadata=metadata)
+        except Exception as exc:
+            self.log(f"Ошибка при загрузке макроса: {exc}")
 
     def run_consistency_test(self):
         if self.is_playing:
@@ -1856,18 +2286,73 @@ class MacroApp(QWidget):
         name = current_item.text()
         filepath = MACROS_DIR / f"{name}.json"
         try:
-            with open(filepath, 'r') as f:
-                events = json.load(f)
+            events, metadata, notes = self._load_macro_file(filepath)
+            for note in notes:
+                self.log(f"[MACRO] {note}")
             self.log(f"Consistency test: макрос '{name}' будет воспроизведен 5 раз подряд.")
-            self._start_playback(events, 5, name, consistency_runs=5)
-        except Exception as e:
-            self.log(f"Ошибка при загрузке макроса: {e}")
+            self._start_playback(events, 5, name, consistency_runs=5, metadata=metadata)
+        except Exception as exc:
+            self.log(f"Ошибка при загрузке макроса: {exc}")
+
+    def _update_diagnostics_output(self, diagnosis: MacroDiagnosis, notes: List[str], source: str):
+        if self.diagnostics_output is not None:
+            report = diagnosis.report
+            if notes:
+                report += "\n\n-- Примечания --\n" + "\n".join(f"* {note}" for note in notes)
+            self.diagnostics_output.setPlainText(report)
+        if self.diagnostics_status_label is not None:
+            if diagnosis.issues:
+                self.diagnostics_status_label.setText(
+                    f"⚠️ Найдено проблем: {len(diagnosis.issues)} | Источник: {source}"
+                )
+            else:
+                self.diagnostics_status_label.setText(f"Проблем не обнаружено. Источник: {source}")
+        self.log(f"Диагностика макроса '{source}' завершена ({len(diagnosis.issues)} проблем).")
+
+    def _run_macro_diagnostics(self, filepath: Path):
+        try:
+            events, metadata, notes = self._load_macro_file(filepath)
+            diagnosis = self.macro_analyzer.analyze(events, metadata)
+            self._update_diagnostics_output(diagnosis, notes, str(filepath))
+            for note in notes:
+                self.log(f"[DIAG] {note}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Диагностика", f"Не удалось выполнить анализ: {exc}")
+
+    def run_selected_macro_diagnostics(self):
+        if self.diagnostics_macro_combo is None:
+            return
+        name = self.diagnostics_macro_combo.currentText().strip()
+        if not name:
+            QMessageBox.warning(self, "Диагностика", "Выберите макрос для анализа.")
+            return
+        filepath = MACROS_DIR / f"{name}.json"
+        if not filepath.exists():
+            QMessageBox.warning(self, "Диагностика", f"Файл макроса '{name}' не найден.")
+            return
+        self._run_macro_diagnostics(filepath)
+
+    def open_external_macro_for_diagnostics(self):
+        start_dir = (
+            os.path.dirname(self._diagnostics_last_external_path)
+            if self._diagnostics_last_external_path
+            else str(MACROS_DIR)
+        )
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть макрос", start_dir, "JSON (*.json)")
+        if not path:
+            return
+        self._diagnostics_last_external_path = path
+        self._run_macro_diagnostics(Path(path))
 
 
-    def play_worker(self, events, loops, name, consistency_runs=None):
+    def play_worker(self, events, loops, name, consistency_runs=None, metadata=None):
         self.update_ui_for_playback(True, name, loops)
         mouse_controller = mouse.Controller()
         keyboard_controller = keyboard.Controller()
+        metadata = metadata or {}
+        if metadata:
+            for line in self._format_metadata_for_log(metadata):
+                self.signals.log_message.emit(line)
 
         pressed_buttons = set()
         last_mouse_pos = None
@@ -2472,6 +2957,8 @@ class MacroApp(QWidget):
                         "cursor_states": set(),
                         "strict_mode": STRICT_MODE_ACTIVE,
                     }
+                    if metadata:
+                        current_run_stats["metadata"] = metadata
 
                 def register_segment_summary(summary, release_offset):
                     nonlocal post_rmb_resume_offset
@@ -2715,16 +3202,47 @@ class MacroApp(QWidget):
         name, ok = QInputDialog.getText(self, "Сохранить макрос", "Введите имя:")
         if ok and name:
             filepath = MACROS_DIR / f"{name}.json"
-            with open(filepath, 'w') as f:
-                json.dump(self.recorded_events, f, indent=4)
-            self.log(f"Макрос '{name}' сохранен.")
-            self.refresh_macro_list()
+            metadata = dict(self.recording_metadata) if isinstance(self.recording_metadata, dict) else {}
+            if not metadata:
+                metadata = self._gather_recording_metadata()
+            metadata.setdefault("format_version", MACRO_FORMAT_VERSION)
+            metadata["saved_as"] = name
+            payload = {
+                "version": MACRO_FORMAT_VERSION,
+                "metadata": metadata,
+                "events": self.recorded_events,
+            }
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=4, ensure_ascii=False)
+                self.recording_metadata = metadata
+                self.log(f"Макрос '{name}' сохранен.")
+                for line in self._format_metadata_for_log(metadata):
+                    self.log(line.replace("[MACRO META]", "[META]"))
+                self.refresh_macro_list()
+            except Exception as exc:
+                QMessageBox.warning(self, "Сохранение макроса", f"Не удалось сохранить макрос: {exc}")
 
     def refresh_macro_list(self):
+        macro_names: List[str] = []
         self.macro_list_widget.clear()
         for filename in sorted(os.listdir(MACROS_DIR)):
             if filename.endswith(".json"):
-                self.macro_list_widget.addItem(QListWidgetItem(filename.replace(".json", "")))
+                name = filename.replace(".json", "")
+                macro_names.append(name)
+                self.macro_list_widget.addItem(QListWidgetItem(name))
+        if self.diagnostics_macro_combo is not None:
+            self.diagnostics_macro_combo.blockSignals(True)
+            self.diagnostics_macro_combo.clear()
+            if macro_names:
+                self.diagnostics_macro_combo.addItems(macro_names)
+                self.diagnostics_macro_combo.setCurrentIndex(0)
+            self.diagnostics_macro_combo.blockSignals(False)
+        if self.diagnostics_status_label is not None:
+            if macro_names:
+                self.diagnostics_status_label.setText("Выберите макрос для анализа.")
+            else:
+                self.diagnostics_status_label.setText("Нет сохраненных макросов.")
 
     def delete_macro(self):
         current_item = self.macro_list_widget.currentItem()
