@@ -7,6 +7,8 @@ import json
 import math
 from pathlib import Path
 
+FIRST_DELTAS_TO_SHOW = 15
+
 def analyze_macro_file(filename):
     print(f"\n=== АНАЛИЗ ФАЙЛА: {filename} ===")
 
@@ -58,6 +60,8 @@ def analyze_macro_file(filename):
             total_rel_dy = 0
             total_rel_count = 0
             total_rel_duration = 0.0
+            total_abs_dx = 0.0
+            total_abs_dy = 0.0
             for seg_idx, segment in enumerate(segments, 1):
                 press_time = segment.get('press_time')
                 release_time = segment.get('release_time')
@@ -69,9 +73,15 @@ def analyze_macro_file(filename):
                 rel_sum_dy = sum(args[1] for _, args in rel_moves)
                 rel_length = math.hypot(rel_sum_dx, rel_sum_dy)
                 rel_rate = (len(rel_moves) / duration) if duration and duration > 0 else len(rel_moves)
+                abs_sum_dx = sum(abs(args[0]) for _, args in rel_moves)
+                abs_sum_dy = sum(abs(args[1]) for _, args in rel_moves)
+                avg_abs_dx = (abs_sum_dx / len(rel_moves)) if rel_moves else 0.0
+                avg_abs_dy = (abs_sum_dy / len(rel_moves)) if rel_moves else 0.0
 
                 total_rel_dx += rel_sum_dx
                 total_rel_dy += rel_sum_dy
+                total_abs_dx += abs_sum_dx
+                total_abs_dy += abs_sum_dy
                 total_rel_count += len(rel_moves)
                 if duration and duration > 0:
                     total_rel_duration += duration
@@ -82,6 +92,7 @@ def analyze_macro_file(filename):
                     print(f"  Длительность: {duration:.4f} с")
                 print(f"  Относительных движений: {len(rel_moves)} (частота {rel_rate:.1f}/с)")
                 print(f"    Сумма Δ: ({rel_sum_dx}, {rel_sum_dy}), длина={rel_length:.2f} px")
+                print(f"    Средняя |Δ|: X={avg_abs_dx:.2f}, Y={avg_abs_dy:.2f}")
 
                 if len(rel_moves) > 1:
                     intervals = [rel_moves[i + 1][1][2] - rel_moves[i][1][2] for i in range(len(rel_moves) - 1)]
@@ -91,8 +102,8 @@ def analyze_macro_file(filename):
                     )
 
                 if rel_moves:
-                    print("    Первые дельты:")
-                    for idx_move, (move_idx, move_args) in enumerate(rel_moves[:10], 1):
+                    print(f"    Первые дельты (до {FIRST_DELTAS_TO_SHOW} шт.):")
+                    for idx_move, (move_idx, move_args) in enumerate(rel_moves[:FIRST_DELTAS_TO_SHOW], 1):
                         move_time = move_args[2]
                         rel_time = (move_time - press_time) if press_time is not None else move_time
                         print(
@@ -110,27 +121,33 @@ def analyze_macro_file(filename):
             if total_rel_count:
                 total_rel_length = math.hypot(total_rel_dx, total_rel_dy)
                 avg_rate = total_rel_count / total_rel_duration if total_rel_duration > 0 else total_rel_count
+                avg_abs_dx_overall = total_abs_dx / total_rel_count if total_rel_count else 0.0
+                avg_abs_dy_overall = total_abs_dy / total_rel_count if total_rel_count else 0.0
                 print("\nСуммарно по всем ПКМ-сегментам:")
                 print(f"  Общая сумма Δ: ({total_rel_dx}, {total_rel_dy}), длина={total_rel_length:.2f} px")
                 print(
                     f"  Всего относительных движений: {total_rel_count}, суммарная длительность={total_rel_duration:.4f} с, "
                     f"средняя частота {avg_rate:.1f}/с"
                 )
+                print(f"  Средняя |Δ|: X={avg_abs_dx_overall:.2f}, Y={avg_abs_dy_overall:.2f}")
 
         if all_relative_moves:
-            print("\nПервые 10 относительных движений по всему макросу:")
-            for idx_move, (move_idx, move_args) in enumerate(all_relative_moves[:10], 1):
+            print(f"\nПервые {min(FIRST_DELTAS_TO_SHOW, len(all_relative_moves))} относительных движений по всему макросу:")
+            for idx_move, (move_idx, move_args) in enumerate(all_relative_moves[:FIRST_DELTAS_TO_SHOW], 1):
                 move_time = move_args[2]
                 print(f"  #{idx_move}: Δ({move_args[0]},{move_args[1]}) @ {move_time:.4f} с (event #{move_idx})")
             all_sum_dx = sum(args[0] for _, args in all_relative_moves)
             all_sum_dy = sum(args[1] for _, args in all_relative_moves)
             all_length = math.hypot(all_sum_dx, all_sum_dy)
+            avg_abs_dx_all = sum(abs(args[0]) for _, args in all_relative_moves) / len(all_relative_moves)
+            avg_abs_dy_all = sum(abs(args[1]) for _, args in all_relative_moves) / len(all_relative_moves)
             first_time = all_relative_moves[0][1][2]
             last_time = all_relative_moves[-1][1][2]
             span = max(0.0, last_time - first_time)
             overall_rate = len(all_relative_moves) / span if span > 0 else len(all_relative_moves)
             print(f"  Всего относительных событий: {len(all_relative_moves)}, span={span:.4f} с, средняя частота {overall_rate:.1f}/с")
             print(f"  Сумма Δ по макросу: ({all_sum_dx}, {all_sum_dy}), длина={all_length:.2f} px")
+            print(f"  Средняя |Δ|: X={avg_abs_dx_all:.2f}, Y={avg_abs_dy_all:.2f}")
             if len(all_relative_moves) > 1:
                 rel_intervals = [
                     all_relative_moves[i + 1][1][2] - all_relative_moves[i][1][2]
