@@ -1,5 +1,12 @@
 # Summary of Camera Movement Playback Stability Fix
 
+## Next-gen macro engine (branch `feat/macro-engine-rmb-drag-camera-3deg-accuracy`)
+
+* Added the brand-new `macro_engine` package with modular recording (`recording.py`), playback (`playback.py`), motion modeling (`camera.py`), Windows I/O glue (`io.py`), storage helpers, and a PySide6 UI (`ui.py`, `app.py`).
+* Implemented RawInput-backed recording with calibration-aware `CameraSample` objects, deterministic playback with sub-pixel accumulation, high-priority scheduling, and segment-level diagnostics that keep RMB drift under ≈3°.
+* Introduced user-facing entry point `macro_engine_app.py` plus documentation (`NEXT_GEN_MACRO_ENGINE.md`) describing the architecture, calibration workflow, and acceptance criteria.
+* Added regression tests (`test_camera_trajectory_new.py`) to validate resampling math and accumulator behavior.
+
 ## Overview
 This fix addresses the critical instability in camera movement reproduction during macro playback for Roblox games. The camera movement (right mouse button drag) was being reproduced with incorrect magnitude and direction.
 
