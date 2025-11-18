@@ -18,6 +18,29 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
+    def _ensure_wintype(attr, ctype):
+        if not hasattr(wintypes, attr):
+            setattr(wintypes, attr, ctype)
+
+    _ensure_wintype("LRESULT", ctypes.c_ssize_t)
+    _ensure_wintype("WPARAM", ctypes.c_size_t)
+    _ensure_wintype("LPARAM", ctypes.c_ssize_t)
+
+    _ensure_wintype("HANDLE", ctypes.c_void_p)
+    _ensure_wintype("HWND", wintypes.HANDLE)
+    _ensure_wintype("HINSTANCE", wintypes.HANDLE)
+    _ensure_wintype("HMODULE", wintypes.HANDLE)
+    _ensure_wintype("HMENU", wintypes.HANDLE)
+    _ensure_wintype("HICON", wintypes.HANDLE)
+    _ensure_wintype("HCURSOR", wintypes.HANDLE)
+    _ensure_wintype("HBRUSH", wintypes.HANDLE)
+    _ensure_wintype("HDC", wintypes.HANDLE)
+
+    _ensure_wintype("ATOM", ctypes.c_ushort)
+    _ensure_wintype("UINT", ctypes.c_uint)
+    _ensure_wintype("DWORD", ctypes.c_uint32)
+    _ensure_wintype("ULONG_PTR", ctypes.c_size_t)
+
     # Константы и структуры для SendInput
     ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
     INPUT_MOUSE = 0
