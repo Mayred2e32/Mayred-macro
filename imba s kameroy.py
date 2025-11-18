@@ -8,6 +8,7 @@ import platform
 import queue
 import statistics
 import threading
+import traceback
 import time
 from collections import deque
 from pathlib import Path
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
     QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFormLayout, QFrame, QGraphicsDropShadowEffect,
-    QFileDialog, QTabWidget,
+    QFileDialog, QTabWidget, QSlider,
 )
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon
 
@@ -87,6 +88,44 @@ DEFAULT_SETTINGS = {
     "reverse_tiny_ratio": 0.1,
     "strict_mode": False,
 }
+
+STABILITY_PRESETS = {
+    "normal": {
+        "label": "Normal",
+        "description": "Сбалансированный профиль для большинства сценариев.",
+        "values": {
+            "deadzone_threshold": 0.5,
+            "reverse_window_ms": 40.0,
+            "reverse_tiny_ratio": 0.1,
+            "sender_max_step": 1,
+            "sender_delay_ms": 3.0,
+        },
+    },
+    "smooth": {
+        "label": "Smooth",
+        "description": "Максимальная стабильность: агрессивные фильтры и минимальные рывки.",
+        "values": {
+            "deadzone_threshold": 0.65,
+            "reverse_window_ms": 60.0,
+            "reverse_tiny_ratio": 0.14,
+            "sender_max_step": 1,
+            "sender_delay_ms": 3.0,
+        },
+    },
+    "fast": {
+        "label": "Fast",
+        "description": "Минимальные задержки для быстрой камеры и трекинга.",
+        "values": {
+            "deadzone_threshold": 0.3,
+            "reverse_window_ms": 25.0,
+            "reverse_tiny_ratio": 0.05,
+            "sender_max_step": 2,
+            "sender_delay_ms": 2.2,
+        },
+    },
+}
+
+STABILITY_CUSTOM_KEY = "custom"
 
 
 def _clamp(value, min_value, max_value):
@@ -961,6 +1000,7 @@ class MacroApp(QWidget):
         self.recording_metadata: Dict[str, Any] = {}
         self.is_recording = False
         self.is_playing = False
+        self._record_thread: Optional[threading.Thread] = None
         self._calibration_in_progress = False
         self.settings_manager = SettingsManager()
         apply_runtime_settings(self.settings_manager.as_dict())
@@ -1091,106 +1131,51 @@ class MacroApp(QWidget):
         form_layout.addRow(self.infinite_checkbox)
         settings_panel_layout.addLayout(form_layout)
 
-        settings_panel_layout.addWidget(QLabel("Камера и чувствительность:"))
+        settings_panel_layout.addWidget(QLabel("Основные настройки камеры:"))
         camera_form = QFormLayout()
         camera_form.setSpacing(10)
 
-        self.camera_gain_spinbox = QDoubleSpinBox()
-        self.camera_gain_spinbox.setRange(0.3, 3.0)
-        self.camera_gain_spinbox.setDecimals(3)
-        self.camera_gain_spinbox.setSingleStep(0.01)
-        self.camera_gain_spinbox.valueChanged.connect(self.on_camera_gain_changed)
-        camera_form.addRow("CAMERA_GAIN:", self.camera_gain_spinbox)
-
-        self.gain_x_spinbox = QDoubleSpinBox()
-        self.gain_x_spinbox.setRange(0.25, 4.0)
-        self.gain_x_spinbox.setDecimals(3)
-        self.gain_x_spinbox.setSingleStep(0.01)
-        self.gain_x_spinbox.valueChanged.connect(self.on_gain_x_changed)
-        camera_form.addRow("GAIN X:", self.gain_x_spinbox)
-
-        self.gain_y_spinbox = QDoubleSpinBox()
-        self.gain_y_spinbox.setRange(0.25, 4.0)
-        self.gain_y_spinbox.setDecimals(3)
-        self.gain_y_spinbox.setSingleStep(0.01)
-        self.gain_y_spinbox.valueChanged.connect(self.on_gain_y_changed)
-        camera_form.addRow("GAIN Y:", self.gain_y_spinbox)
-
-        invert_container = QWidget()
-        invert_layout = QHBoxLayout(invert_container)
-        invert_layout.setContentsMargins(0, 0, 0, 0)
-        invert_layout.setSpacing(10)
-        self.invert_x_checkbox = QCheckBox("Invert X")
-        self.invert_y_checkbox = QCheckBox("Invert Y")
-        self.invert_x_checkbox.stateChanged.connect(self.on_invert_x_changed)
-        self.invert_y_checkbox.stateChanged.connect(self.on_invert_y_changed)
-        invert_layout.addWidget(self.invert_x_checkbox)
-        invert_layout.addWidget(self.invert_y_checkbox)
-        camera_form.addRow("Инверсия осей:", invert_container)
-
-        self.deadzone_spinbox = QDoubleSpinBox()
-        self.deadzone_spinbox.setRange(0.0, 2.0)
-        self.deadzone_spinbox.setDecimals(3)
-        self.deadzone_spinbox.setSingleStep(0.05)
-        self.deadzone_spinbox.valueChanged.connect(self.on_deadzone_changed)
-        camera_form.addRow("Deadzone (px):", self.deadzone_spinbox)
-
-        self.reverse_window_spinbox = QDoubleSpinBox()
-        self.reverse_window_spinbox.setRange(10.0, 120.0)
-        self.reverse_window_spinbox.setDecimals(1)
-        self.reverse_window_spinbox.setSingleStep(1.0)
-        self.reverse_window_spinbox.valueChanged.connect(self.on_reverse_window_changed)
-        camera_form.addRow("Suppress window (мс):", self.reverse_window_spinbox)
-
-        self.reverse_ratio_spinbox = QDoubleSpinBox()
-        self.reverse_ratio_spinbox.setRange(0.01, 0.5)
-        self.reverse_ratio_spinbox.setDecimals(3)
-        self.reverse_ratio_spinbox.setSingleStep(0.01)
-        self.reverse_ratio_spinbox.valueChanged.connect(self.on_reverse_ratio_changed)
-        camera_form.addRow("Tiny reverse ratio:", self.reverse_ratio_spinbox)
-
-        self.strict_mode_checkbox = QCheckBox("Strict mode (без фильтров)")
-        self.strict_mode_checkbox.stateChanged.connect(self.on_strict_mode_changed)
-        camera_form.addRow("Strict mode:", self.strict_mode_checkbox)
-
-        self.sender_step_spinbox = QSpinBox()
-        self.sender_step_spinbox.setRange(1, 2)
-        self.sender_step_spinbox.valueChanged.connect(self.on_sender_step_changed)
-        camera_form.addRow("Max step (px):", self.sender_step_spinbox)
-
-        self.sender_delay_spinbox = QDoubleSpinBox()
-        self.sender_delay_spinbox.setRange(2.0, 3.0)
-        self.sender_delay_spinbox.setDecimals(3)
-        self.sender_delay_spinbox.setSingleStep(0.1)
-        self.sender_delay_spinbox.valueChanged.connect(self.on_sender_delay_changed)
-        camera_form.addRow("Delay (мс):", self.sender_delay_spinbox)
+        camera_slider_container = QWidget()
+        camera_slider_layout = QHBoxLayout(camera_slider_container)
+        camera_slider_layout.setContentsMargins(0, 0, 0, 0)
+        camera_slider_layout.setSpacing(8)
+        self.camera_gain_slider = QSlider(Qt.Horizontal)
+        self.camera_gain_slider.setRange(30, 300)
+        self.camera_gain_slider.setSingleStep(1)
+        self.camera_gain_slider.valueChanged.connect(self.on_camera_gain_slider_changed)
+        self.camera_gain_slider.setToolTip("Настраивает общий множитель чувствительности камеры (0.30–3.00).")
+        self.camera_gain_value_label = QLabel("1.00x")
+        self.camera_gain_value_label.setMinimumWidth(55)
+        self.camera_gain_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        camera_slider_layout.addWidget(self.camera_gain_slider, 1)
+        camera_slider_layout.addWidget(self.camera_gain_value_label)
+        camera_form.addRow("Camera sensitivity:", camera_slider_container)
 
         self.sender_mode_combobox = QComboBox()
-        self.sender_mode_combobox.addItem("Auto (SendInput -> mouse_event)", "auto")
+        self.sender_mode_combobox.addItem("Auto (SendInput → mouse_event)", "auto")
         self.sender_mode_combobox.addItem("SendInput", "sendinput")
         self.sender_mode_combobox.addItem("mouse_event", "mouse_event")
         self.sender_mode_combobox.currentIndexChanged.connect(self.on_sender_mode_changed)
+        self.sender_mode_combobox.setToolTip("Режим отправки относительных движений мыши.")
         camera_form.addRow("Sender:", self.sender_mode_combobox)
 
-        self.cursor_lock_checkbox = QCheckBox("Cursor-lock при RMB")
+        self.cursor_lock_checkbox = QCheckBox("Включить во время RMB drag")
         self.cursor_lock_checkbox.stateChanged.connect(self.on_cursor_lock_changed)
+        self.cursor_lock_checkbox.setToolTip("Блокирует курсор в окне игры для стабильной записи и воспроизведения.")
         camera_form.addRow("Cursor lock:", self.cursor_lock_checkbox)
 
-        self.calibration_target_spinbox = QDoubleSpinBox()
-        self.calibration_target_spinbox.setRange(50.0, 2000.0)
-        self.calibration_target_spinbox.setDecimals(1)
-        self.calibration_target_spinbox.setSingleStep(10.0)
-        self.calibration_target_spinbox.valueChanged.connect(self.on_calibration_target_changed)
-        self.calibrate_button = QPushButton("Автокалибровка")
-        self.calibrate_button.clicked.connect(self.start_autocalibration)
-
-        calibration_container = QWidget()
-        calibration_layout = QHBoxLayout(calibration_container)
-        calibration_layout.setContentsMargins(0, 0, 0, 0)
-        calibration_layout.setSpacing(8)
-        calibration_layout.addWidget(self.calibration_target_spinbox)
-        calibration_layout.addWidget(self.calibrate_button)
-        camera_form.addRow("Цель (px):", calibration_container)
+        self.stability_profile_combobox = QComboBox()
+        for key, preset in STABILITY_PRESETS.items():
+            label = preset.get("label", key.title())
+            description = preset.get("description", "")
+            self.stability_profile_combobox.addItem(label, key)
+            index = self.stability_profile_combobox.count() - 1
+            if description:
+                self.stability_profile_combobox.setItemData(index, description, Qt.ToolTipRole)
+        self.stability_profile_combobox.addItem("Custom", STABILITY_CUSTOM_KEY)
+        self.stability_profile_combobox.currentIndexChanged.connect(self.on_stability_profile_changed)
+        self.stability_profile_combobox.setToolTip("Профили, которые автоматически настраивают deadzone, suppress window и задержки.")
+        camera_form.addRow("Stability:", self.stability_profile_combobox)
 
         settings_panel_layout.addLayout(camera_form)
 
@@ -1242,6 +1227,9 @@ class MacroApp(QWidget):
 
         self.tabs.addTab(main_tab, "Главная")
 
+        advanced_tab = self._build_advanced_settings_tab()
+        self.tabs.addTab(advanced_tab, "Advanced")
+
         # --- Вкладка диагностики ---
         diagnostics_tab = QWidget()
         diagnostics_layout = QVBoxLayout(diagnostics_tab)
@@ -1274,6 +1262,128 @@ class MacroApp(QWidget):
         diagnostics_layout.addWidget(self.diagnostics_output, 1)
 
         self.tabs.addTab(diagnostics_tab, "Diagnostics")
+
+    def _build_advanced_settings_tab(self):
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(20, 20, 20, 20)
+        tab_layout.setSpacing(12)
+
+        title = QLabel("Advanced camera & filter settings")
+        title.setObjectName("diagTitle")
+        description = QLabel(
+            "Тонкая настройка чувствительности, фильтров и отправки. "
+            "Используйте эти параметры только при необходимости: изменения немедленно применяются."
+        )
+        description.setWordWrap(True)
+        tab_layout.addWidget(title)
+        tab_layout.addWidget(description)
+
+        advanced_form = QFormLayout()
+        advanced_form.setSpacing(10)
+
+        self.camera_gain_spinbox = QDoubleSpinBox()
+        self.camera_gain_spinbox.setRange(0.3, 3.0)
+        self.camera_gain_spinbox.setDecimals(3)
+        self.camera_gain_spinbox.setSingleStep(0.01)
+        self.camera_gain_spinbox.valueChanged.connect(self.on_camera_gain_changed)
+        self.camera_gain_spinbox.setToolTip("Точное значение CAMERA_GAIN. Полезно, если нужно задать чувствительность вручную.")
+        advanced_form.addRow("CAMERA_GAIN:", self.camera_gain_spinbox)
+
+        self.gain_x_spinbox = QDoubleSpinBox()
+        self.gain_x_spinbox.setRange(0.25, 4.0)
+        self.gain_x_spinbox.setDecimals(3)
+        self.gain_x_spinbox.setSingleStep(0.01)
+        self.gain_x_spinbox.valueChanged.connect(self.on_gain_x_changed)
+        self.gain_x_spinbox.setToolTip("Множитель для оси X. Применяется поверх CAMERA_GAIN.")
+        advanced_form.addRow("GAIN X:", self.gain_x_spinbox)
+
+        self.gain_y_spinbox = QDoubleSpinBox()
+        self.gain_y_spinbox.setRange(0.25, 4.0)
+        self.gain_y_spinbox.setDecimals(3)
+        self.gain_y_spinbox.setSingleStep(0.01)
+        self.gain_y_spinbox.valueChanged.connect(self.on_gain_y_changed)
+        self.gain_y_spinbox.setToolTip("Множитель для оси Y. Применяется поверх CAMERA_GAIN.")
+        advanced_form.addRow("GAIN Y:", self.gain_y_spinbox)
+
+        invert_container = QWidget()
+        invert_layout = QHBoxLayout(invert_container)
+        invert_layout.setContentsMargins(0, 0, 0, 0)
+        invert_layout.setSpacing(10)
+        self.invert_x_checkbox = QCheckBox("Invert X")
+        self.invert_y_checkbox = QCheckBox("Invert Y")
+        self.invert_x_checkbox.stateChanged.connect(self.on_invert_x_changed)
+        self.invert_y_checkbox.stateChanged.connect(self.on_invert_y_changed)
+        self.invert_x_checkbox.setToolTip("Инвертировать движения по оси X при воспроизведении.")
+        self.invert_y_checkbox.setToolTip("Инвертировать движения по оси Y при воспроизведении.")
+        invert_layout.addWidget(self.invert_x_checkbox)
+        invert_layout.addWidget(self.invert_y_checkbox)
+        advanced_form.addRow("Инверсия осей:", invert_container)
+
+        self.deadzone_spinbox = QDoubleSpinBox()
+        self.deadzone_spinbox.setRange(0.0, 2.0)
+        self.deadzone_spinbox.setDecimals(3)
+        self.deadzone_spinbox.setSingleStep(0.05)
+        self.deadzone_spinbox.valueChanged.connect(self.on_deadzone_changed)
+        self.deadzone_spinbox.setToolTip("Порог отсечки микродвижений. Чем больше значение, тем устойчивее камера.")
+        advanced_form.addRow("Deadzone (px):", self.deadzone_spinbox)
+
+        self.reverse_window_spinbox = QDoubleSpinBox()
+        self.reverse_window_spinbox.setRange(10.0, 120.0)
+        self.reverse_window_spinbox.setDecimals(1)
+        self.reverse_window_spinbox.setSingleStep(1.0)
+        self.reverse_window_spinbox.valueChanged.connect(self.on_reverse_window_changed)
+        self.reverse_window_spinbox.setToolTip("Интервал (в мс), в течение которого подавляются мелкие откаты движения.")
+        advanced_form.addRow("Suppress window (мс):", self.reverse_window_spinbox)
+
+        self.reverse_ratio_spinbox = QDoubleSpinBox()
+        self.reverse_ratio_spinbox.setRange(0.01, 0.5)
+        self.reverse_ratio_spinbox.setDecimals(3)
+        self.reverse_ratio_spinbox.setSingleStep(0.01)
+        self.reverse_ratio_spinbox.valueChanged.connect(self.on_reverse_ratio_changed)
+        self.reverse_ratio_spinbox.setToolTip("Порог tiny reverse. Пропорция от среднего шага, при которой мелкие откаты игнорируются.")
+        advanced_form.addRow("Tiny reverse ratio:", self.reverse_ratio_spinbox)
+
+        self.strict_mode_checkbox = QCheckBox("Strict mode (без фильтров)")
+        self.strict_mode_checkbox.stateChanged.connect(self.on_strict_mode_changed)
+        self.strict_mode_checkbox.setToolTip("Отключает deadzone и подавление откатов. Камера повторяет запись максимально точно.")
+        advanced_form.addRow("Strict mode:", self.strict_mode_checkbox)
+
+        self.sender_step_spinbox = QSpinBox()
+        self.sender_step_spinbox.setRange(1, 2)
+        self.sender_step_spinbox.valueChanged.connect(self.on_sender_step_changed)
+        self.sender_step_spinbox.setToolTip("Максимальный шаг SendInput. Значение 2 ускоряет отправку, но может снизить плавность.")
+        advanced_form.addRow("Max step (px):", self.sender_step_spinbox)
+
+        self.sender_delay_spinbox = QDoubleSpinBox()
+        self.sender_delay_spinbox.setRange(2.0, 3.0)
+        self.sender_delay_spinbox.setDecimals(3)
+        self.sender_delay_spinbox.setSingleStep(0.1)
+        self.sender_delay_spinbox.valueChanged.connect(self.on_sender_delay_changed)
+        self.sender_delay_spinbox.setToolTip("Задержка (в мс) между отправками относительных шагов.")
+        advanced_form.addRow("Delay (мс):", self.sender_delay_spinbox)
+
+        self.calibration_target_spinbox = QDoubleSpinBox()
+        self.calibration_target_spinbox.setRange(50.0, 2000.0)
+        self.calibration_target_spinbox.setDecimals(1)
+        self.calibration_target_spinbox.setSingleStep(10.0)
+        self.calibration_target_spinbox.valueChanged.connect(self.on_calibration_target_changed)
+        self.calibration_target_spinbox.setToolTip("Желаемая длина шага в пикселях для автокалибровки.")
+        self.calibrate_button = QPushButton("Автокалибровка")
+        self.calibrate_button.clicked.connect(self.start_autocalibration)
+        self.calibrate_button.setToolTip("Запускает мастера автокалибровки. Удерживайте ПКМ и выполните плавный drag.")
+
+        calibration_container = QWidget()
+        calibration_layout = QHBoxLayout(calibration_container)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_layout.setSpacing(8)
+        calibration_layout.addWidget(self.calibration_target_spinbox)
+        calibration_layout.addWidget(self.calibrate_button)
+        advanced_form.addRow("Цель (px):", calibration_container)
+
+        tab_layout.addLayout(advanced_form)
+        tab_layout.addStretch(1)
+        return tab
 
     def _apply_styles(self):
         """Применяет весь QSS-стиль к приложению."""
@@ -1422,12 +1532,59 @@ class MacroApp(QWidget):
         checkbox.setChecked(checked)
         checkbox.blockSignals(False)
 
+    def _set_camera_slider_value(self, gain_value: float):
+        if not hasattr(self, "camera_gain_slider"):
+            return
+        slider_value = int(round(gain_value * 100))
+        slider_value = max(self.camera_gain_slider.minimum(), min(self.camera_gain_slider.maximum(), slider_value))
+        self.camera_gain_slider.blockSignals(True)
+        self.camera_gain_slider.setValue(slider_value)
+        self.camera_gain_slider.blockSignals(False)
+
+    def _update_camera_gain_indicator(self, gain_value: float):
+        if hasattr(self, "camera_gain_value_label") and self.camera_gain_value_label is not None:
+            self.camera_gain_value_label.setText(f"{gain_value:.2f}x")
+
+    def _detect_stability_preset(self, data: Dict[str, Any]) -> str:
+        for key, preset in STABILITY_PRESETS.items():
+            values = preset.get("values", {})
+            matched = True
+            for setting_key, expected_value in values.items():
+                current_value = data.get(setting_key)
+                if isinstance(expected_value, float):
+                    current_value = float(current_value if current_value is not None else 0)
+                    if abs(current_value - float(expected_value)) > 0.01:
+                        matched = False
+                        break
+                else:
+                    if current_value != expected_value:
+                        matched = False
+                        break
+            if matched:
+                return key
+        return STABILITY_CUSTOM_KEY
+
+    def _update_stability_combo(self, data: Dict[str, Any]):
+        if not hasattr(self, "stability_profile_combobox") or self.stability_profile_combobox is None:
+            return
+        preset_key = self._detect_stability_preset(data)
+        target_index = self.stability_profile_combobox.findData(preset_key)
+        if target_index == -1:
+            target_index = self.stability_profile_combobox.findData(STABILITY_CUSTOM_KEY)
+        self.stability_profile_combobox.blockSignals(True)
+        if target_index != -1:
+            self.stability_profile_combobox.setCurrentIndex(target_index)
+        self.stability_profile_combobox.blockSignals(False)
+
     def _refresh_settings_controls(self, data=None):
         if not hasattr(self, "camera_gain_spinbox"):
             return
         if data is None:
             data = self.settings_manager.as_dict()
-        self._set_spin_value(self.camera_gain_spinbox, float(data.get("camera_gain", CAMERA_GAIN)))
+        camera_gain_value = float(data.get("camera_gain", CAMERA_GAIN))
+        self._set_spin_value(self.camera_gain_spinbox, camera_gain_value)
+        self._set_camera_slider_value(camera_gain_value)
+        self._update_camera_gain_indicator(camera_gain_value)
         self._set_spin_value(self.gain_x_spinbox, float(data.get("gain_x", GAIN_X_MULTIPLIER)))
         self._set_spin_value(self.gain_y_spinbox, float(data.get("gain_y", GAIN_Y_MULTIPLIER)))
         self._set_checkbox_state(self.invert_x_checkbox, bool(data.get("invert_x", INVERT_X_AXIS)))
@@ -1452,6 +1609,7 @@ class MacroApp(QWidget):
             self._set_checkbox_state(self.cursor_lock_checkbox, bool(data.get("cursor_lock_enabled", CURSOR_LOCK_ENABLED)))
 
         self._set_spin_value(self.calibration_target_spinbox, float(data.get("calibration_target_px", CALIBRATION_TARGET_PX)))
+        self._update_stability_combo(data)
         self._update_calibration_ui_state()
 
     def _on_settings_updated(self, data):
@@ -1540,11 +1698,24 @@ class MacroApp(QWidget):
         timestamp = time.strftime("%H:%M:%S")
         self.log_edit.append(f"[{timestamp}] {message}")
 
-    def on_camera_gain_changed(self, value):
-        self._update_setting("camera_gain", float(value))
+    def _apply_camera_gain_change(self, value, source="spinbox"):
+        gain_value = _clamp(float(value), 0.3, 3.0)
+        if source != "spinbox":
+            self._set_spin_value(self.camera_gain_spinbox, gain_value)
+        if source != "slider":
+            self._set_camera_slider_value(gain_value)
+        self._update_camera_gain_indicator(gain_value)
+        self._update_setting("camera_gain", gain_value)
         self.log(
             f"CAMERA_GAIN = {CAMERA_GAIN:.3f} → X={CAMERA_GAIN_X:.3f}, Y={CAMERA_GAIN_Y:.3f}"
         )
+
+    def on_camera_gain_changed(self, value):
+        self._apply_camera_gain_change(float(value), source="spinbox")
+
+    def on_camera_gain_slider_changed(self, slider_value):
+        gain_value = slider_value / 100.0
+        self._apply_camera_gain_change(gain_value, source="slider")
 
     def on_gain_x_changed(self, value):
         self._update_setting("gain_x", float(value))
@@ -1612,6 +1783,32 @@ class MacroApp(QWidget):
         self._update_setting("cursor_lock_enabled", enabled)
         status = "включен" if CURSOR_LOCK_ENABLED else "выключен"
         self.log(f"Cursor-lock {status}")
+
+    def apply_stability_preset(self, preset_key: str):
+        preset = STABILITY_PRESETS.get(preset_key)
+        if not preset:
+            return
+        values = preset.get("values", {})
+        current = self.settings_manager.as_dict()
+        updated = current.copy()
+        updated.update(values)
+        if updated == current:
+            self._update_stability_combo(updated)
+            return
+        self.settings_manager.data = sanitize_settings(updated)
+        self.settings_manager.save()
+        refreshed = self.settings_manager.as_dict()
+        self._on_settings_updated(refreshed)
+        label = preset.get("label", preset_key)
+        self.log(f"[STABILITY] Профиль '{label}' применён.")
+
+    def on_stability_profile_changed(self, index):
+        if not hasattr(self, "stability_profile_combobox") or self.stability_profile_combobox is None:
+            return
+        preset_key = self.stability_profile_combobox.itemData(index)
+        if not preset_key or preset_key == STABILITY_CUSTOM_KEY:
+            return
+        self.apply_stability_preset(str(preset_key))
 
     def on_shiftlock_record_changed(self, state):
         enabled = (state == Qt.Checked)
@@ -2057,21 +2254,76 @@ class MacroApp(QWidget):
 
     def toggle_recording(self):
         if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        if self.is_playing:
+            QMessageBox.warning(self, "Запись", "Остановите воспроизведение прежде чем записывать новый макрос.")
+            return
+        if self._record_thread and self._record_thread.is_alive():
+            self.log("Предыдущая запись ещё завершается. Подождите пару секунд...")
+            return
+        self.recorded_events = []
+        metadata = self._gather_recording_metadata()
+        metadata.update({
+            "raw_input_available": False,
+            "relative_events": 0,
+            "absolute_events": 0,
+            "raw_relative_events": 0,
+            "recording_started_at": time.time(),
+        })
+        self.recording_metadata = metadata
+        self.is_recording = True
+        self.update_ui_for_recording(True)
+        shiftlock_state = "включен" if self.recording_metadata.get("shiftlock") else "выключен"
+        self.log(f"[REC STATE] Recording started (ShiftLock {shiftlock_state}).")
+        self._record_thread = threading.Thread(target=self._recording_thread_entry, daemon=True)
+        self._record_thread.start()
+
+    def stop_recording(self):
+        if not self.is_recording:
+            if self._record_thread and self._record_thread.is_alive():
+                self.log("Ожидание завершения записи...")
+            return
+        self.log("[REC STATE] Stop requested...")
+        self.is_recording = False
+        self.recording_metadata.setdefault("stopped_at", time.time())
+        self.update_ui_for_recording(False)
+
+    def _recording_thread_entry(self):
+        error_message = None
+        try:
+            self.record_worker()
+        except Exception as exc:
+            error_message = f"[REC ERROR] {exc}"
+            traceback.print_exc()
+            self.signals.log_message.emit(error_message)
+            self.recording_metadata.setdefault("error", str(exc))
+        finally:
             self.is_recording = False
             self.recording_metadata.setdefault("stopped_at", time.time())
-            self.log("Остановка записи...")
-        else:
-            self.recording_metadata = self._gather_recording_metadata()
-            self.recording_metadata.update({
-                "raw_input_available": False,
-                "relative_events": 0,
-                "absolute_events": 0,
-            })
-            self.is_recording = True
-            threading.Thread(target=self.record_worker, daemon=True).start()
-            self.update_ui_for_recording(True)
-            shiftlock_state = "включен" if self.recording_metadata.get("shiftlock") else "выключен"
-            self.log(f"Запись началась! ShiftLock {shiftlock_state}. Выполняйте действия...")
+            self._emit_recording_summary()
+            self._record_thread = None
+            self.signals.recording_stopped.emit()
+
+    def _emit_recording_summary(self):
+        metadata = self.recording_metadata if isinstance(self.recording_metadata, dict) else {}
+        duration = float(metadata.get("recording_duration", 0.0))
+        rel_events = int(metadata.get("relative_events", 0))
+        abs_events = int(metadata.get("absolute_events", 0))
+        raw_events = int(metadata.get("raw_relative_events", 0))
+        raw_available = metadata.get("raw_input_available")
+        raw_used = metadata.get("raw_input_used")
+        total_events = len(self.recorded_events)
+        raw_state = "ON" if raw_available else "OFF"
+        raw_usage = "used" if raw_used else "idle"
+        summary = (
+            f"[REC STATE] Recording stopped: events={total_events} (rel={rel_events}, abs={abs_events}), "
+            f"raw={raw_events}, duration={duration:.2f}s, RAW input={raw_state}/{raw_usage}"
+        )
+        self.signals.log_message.emit(summary)
 
     def record_worker(self):
         self.recorded_events = []
@@ -2098,7 +2350,7 @@ class MacroApp(QWidget):
             try:
                 raw_listener = RawMouseDeltaListener()
                 raw_listener.start()
-                raw_listener_ready = raw_listener.wait_until_ready()
+                raw_listener_ready = raw_listener.wait_until_ready(2.0)
                 metadata["raw_input_available"] = bool(raw_listener_ready)
                 if DEBUG_CAMERA_MOVEMENT:
                     status = "готов" if raw_listener_ready else "не запущен"
@@ -2250,7 +2502,6 @@ class MacroApp(QWidget):
         metadata["relative_events"] = sum(1 for evt, _ in self.recorded_events if evt == 'mouse_move_relative')
         metadata["absolute_events"] = sum(1 for evt, _ in self.recorded_events if evt == 'mouse_move')
         metadata["raw_relative_events"] = raw_move_count
-        self.signals.recording_stopped.emit()
 
     def _start_playback(self, events, loops, name, consistency_runs=None, metadata=None):
         self.is_playing = True
