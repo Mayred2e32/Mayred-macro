@@ -318,6 +318,37 @@ if IS_WINDOWS:
     import time
     from ctypes import wintypes
 
+    def _ensure_wintype(attr, ctype):
+        if not hasattr(wintypes, attr):
+            setattr(wintypes, attr, ctype)
+
+    _ensure_wintype("LRESULT", ctypes.c_ssize_t)
+    _ensure_wintype("WPARAM", ctypes.c_size_t)
+    _ensure_wintype("LPARAM", ctypes.c_ssize_t)
+
+    _ensure_wintype("HANDLE", ctypes.c_void_p)
+    _ensure_wintype("HWND", wintypes.HANDLE)
+    _ensure_wintype("HINSTANCE", wintypes.HANDLE)
+    _ensure_wintype("HMODULE", wintypes.HANDLE)
+    _ensure_wintype("HMENU", wintypes.HANDLE)
+    _ensure_wintype("HICON", wintypes.HANDLE)
+    _ensure_wintype("HCURSOR", wintypes.HANDLE)
+    _ensure_wintype("HBRUSH", wintypes.HANDLE)
+    _ensure_wintype("HDC", wintypes.HANDLE)
+
+    _ensure_wintype("ATOM", ctypes.c_ushort)
+    _ensure_wintype("UINT", ctypes.c_uint)
+    _ensure_wintype("DWORD", ctypes.c_uint32)
+    _ensure_wintype("ULONG_PTR", ctypes.c_size_t)
+
+    WNDPROC = ctypes.WINFUNCTYPE(
+        wintypes.LRESULT,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
     # Константы и структуры для SendInput
     ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
     INPUT_MOUSE = 0
@@ -679,13 +710,6 @@ if IS_WINDOWS:
             ("data", RAWINPUTDATA),
         ]
 
-    WNDPROC = ctypes.WINFUNCTYPE(
-        wintypes.LRESULT,
-        wintypes.HWND,
-        wintypes.UINT,
-        wintypes.WPARAM,
-        wintypes.LPARAM,
-    )
 
     class WNDCLASS(ctypes.Structure):
         _fields_ = [
@@ -2332,12 +2356,52 @@ class MacroApp(QWidget):
         metadata.setdefault("raw_relative_events", 0)
         metadata["recording_started_at"] = metadata.get("recording_started_at", time.time())
         start_time = time.perf_counter()
-        def get_offset(): return time.perf_counter() - start_time
+
+        def get_offset():
+            return time.perf_counter() - start_time
+
+        def _normalize_cursor_position(raw_pos):
+            x = y = 0.0
+            try:
+                if isinstance(raw_pos, (tuple, list)):
+                    candidate = raw_pos
+                    if candidate and isinstance(candidate[0], (tuple, list)):
+                        candidate = candidate[0]
+                    candidate_list = list(candidate)
+                    if len(candidate_list) < 2:
+                        candidate_list.extend([0.0] * (2 - len(candidate_list)))
+                    x, y = candidate_list[0], candidate_list[1]
+                elif isinstance(raw_pos, dict):
+                    x = raw_pos.get("x", raw_pos.get("X", 0.0))
+                    y = raw_pos.get("y", raw_pos.get("Y", 0.0))
+                elif hasattr(raw_pos, "x") and hasattr(raw_pos, "y"):
+                    x = getattr(raw_pos, "x", 0.0)
+                    y = getattr(raw_pos, "y", 0.0)
+                else:
+                    value = float(raw_pos)
+                    x = y = value
+            except (TypeError, ValueError):
+                x = y = 0.0
+            return x, y
+
         mouse_controller = mouse.Controller()
-        initial_pos = (mouse_controller.position[0], mouse_controller.position[1])
-        metadata["initial_cursor"] = {"x": int(initial_pos[0]), "y": int(initial_pos[1])}
-        self.recorded_events.append(('mouse_pos', (initial_pos[0], initial_pos[1], 0.0)))
-        
+        raw_initial_pos = getattr(mouse_controller, "position", (0, 0))
+        normalized_x, normalized_y = _normalize_cursor_position(raw_initial_pos)
+        initial_x = _to_int(normalized_x, 0)
+        initial_y = _to_int(normalized_y, 0)
+        initial_pos = (initial_x, initial_y)
+        metadata["initial_cursor"] = {"x": initial_x, "y": initial_y}
+        self.recorded_events.append(('mouse_pos', (initial_x, initial_y, 0.0)))
+        init_message = f"[INIT CURSOR] raw={raw_initial_pos!r} \u2192 ({initial_x}, {initial_y})"
+        signals_obj = getattr(self, "signals", None)
+        if signals_obj and hasattr(signals_obj, "log_message"):
+            try:
+                signals_obj.log_message.emit(init_message)
+            except Exception:
+                print(init_message)
+        else:
+            print(init_message)
+
         # Отслеживание состояния и дебаг
         pressed_buttons = set()
         mouse_move_count = 0
