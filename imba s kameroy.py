@@ -1,4 +1,3 @@
-а вот код
 import sys
 import time
 import threading
